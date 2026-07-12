@@ -39,9 +39,18 @@ android {
 		}
 		resValue 'string', 'tg_backup_bot_token', localProperties.getProperty('tg_backup_bot_token', '')
 	}
+	signingConfigs {
+		debug {
+			storeFile file("debug.keystore")
+			storePassword "android"
+			keyAlias "debug"
+			keyPassword "android"
+		}
+	}
 	buildTypes {
 		debug {
 			applicationIdSuffix = '.debug'
+			signingConfig = signingConfigs.getByName("debug")
 		}
 		release {
 			minifyEnabled true
