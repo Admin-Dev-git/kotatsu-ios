@@ -13,6 +13,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.Cookie
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.core.exceptions.CloudFlareException
 import org.koitharu.kotatsu.core.network.CommonHeaders
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
@@ -73,32 +75,76 @@ class WebViewExecutor @Inject constructor(
 	}
 
 	suspend fun tryResolveCaptcha(exception: CloudFlareException, timeout: Long): Boolean = mutex.withLock {
-		runCatchingCancellable {
-			withContext(Dispatchers.Main.immediate) {
-				val webView = obtainWebView()
-				try {
-					exception.source.getUserAgent()?.let {
-						webView.settings.userAgentString = it
-					}
-					withTimeout(timeout) {
-						suspendCancellableCoroutine { cont ->
-							webView.webViewClient = CaptchaContinuationClient(
-								cookieJar = cookieJar,
-								targetUrl = exception.url,
-								continuation = cont,
-							)
-							webView.loadUrl(exception.url)
+		// Retry up to MAX_RESOLVE_ATTEMPTS times with increasing timeout
+		for (attempt in 1..MAX_RESOLVE_ATTEMPTS) {
+			val attemptTimeout = timeout + (attempt - 1) * RETRY_TIMEOUT_INCREMENT
+			val result = runCatchingCancellable {
+				withContext(Dispatchers.Main.immediate) {
+					val webView = obtainWebView()
+					try {
+						exception.source.getUserAgent()?.let {
+							webView.settings.userAgentString = it
 						}
+						// Sync existing cookies to WebView before loading
+						syncCookiesToWebView(exception.url)
+						withTimeout(attemptTimeout) {
+							suspendCancellableCoroutine { cont ->
+								webView.webViewClient = CaptchaContinuationClient(
+									cookieJar = cookieJar,
+									targetUrl = exception.url,
+									continuation = cont,
+								)
+								webView.loadUrl(exception.url)
+							}
+						}
+						// Flush and sync cookies back
+						android.webkit.CookieManager.getInstance().flush()
+						syncCookiesFromWebView(exception.url)
+					} finally {
+						webView.reset()
 					}
-					android.webkit.CookieManager.getInstance().flush()
-				} finally {
-					webView.reset()
+				}
+			}.onFailure { e ->
+				e.printStackTraceDebug()
+				if (attempt == MAX_RESOLVE_ATTEMPTS) {
+					exception.addSuppressed(e)
 				}
 			}
-		}.onFailure { e ->
-			exception.addSuppressed(e)
-			e.printStackTraceDebug()
-		}.isSuccess
+			if (result.isSuccess) return@withLock true
+		}
+		false
+	}
+
+	/**
+	 * Sync cookies from OkHttp CookieJar to Android WebView CookieManager
+	 * so the WebView starts with any existing session cookies.
+	 */
+	private fun syncCookiesToWebView(url: String) {
+		val httpUrl = url.toHttpUrlOrNull() ?: return
+		val cookies = cookieJar.loadForRequest(httpUrl)
+		val cookieManager = android.webkit.CookieManager.getInstance()
+		for (cookie in cookies) {
+			cookieManager.setCookie(url, cookie.toString())
+		}
+		cookieManager.flush()
+	}
+
+	/**
+	 * Sync cookies from Android WebView CookieManager back to OkHttp CookieJar
+	 * to ensure cf_clearance and other session cookies are available.
+	 */
+	private fun syncCookiesFromWebView(url: String) {
+		val httpUrl = url.toHttpUrlOrNull() ?: return
+		val cookieManager = android.webkit.CookieManager.getInstance()
+		val cookieString = cookieManager.getCookie(url) ?: return
+		val cookies = cookieString.split(";").mapNotNull { raw ->
+			val trimmed = raw.trim()
+			if (trimmed.isEmpty()) return@mapNotNull null
+			Cookie.parse(httpUrl, trimmed)
+		}
+		if (cookies.isNotEmpty()) {
+			cookieJar.saveFromResponse(httpUrl, cookies)
+		}
 	}
 
 	private suspend fun obtainWebView(): WebView {
@@ -131,5 +177,10 @@ class WebViewExecutor @Inject constructor(
 		settings.userAgentString = defaultUserAgent
 		loadDataWithBaseURL(null, " ", "text/html", null, null)
 		clearHistory()
+	}
+
+	companion object {
+		private const val MAX_RESOLVE_ATTEMPTS = 3
+		private const val RETRY_TIMEOUT_INCREMENT = 10_000L // Add 10s per retry
 	}
 }

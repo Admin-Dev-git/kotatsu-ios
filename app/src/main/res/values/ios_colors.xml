@@ -1,20 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 	<!-- Cyan/teal accent system -->
-	<color name="ios_system_blue">#00C9A7</color>
-	<color name="ios_system_blue_dark">#00B89C</color>
-	<color name="ios_system_blue_light">#40D4BA</color>
-	<color name="ios_accent_teal">#00C9A7</color>
-	<color name="ios_accent_teal_translucent">#3300C9A7</color>
+	<color name="ios_system_blue">#4ECDC4</color>
+	<color name="ios_system_blue_dark">#3DBDB5</color>
+	<color name="ios_system_blue_light">#6ED7D0</color>
+	<color name="ios_accent_teal">#4ECDC4</color>
+	<color name="ios_accent_teal_translucent">#334ECDC4</color>
 
 	<!-- Dark surfaces -->
-	<color name="ios_grouped_background">#0A0A0A</color>
-	<color name="ios_secondary_grouped">#141414</color>
-	<color name="ios_surface_dark">#0A0A0A</color>
-	<color name="ios_surface_card">#1A1A1A</color>
-	<color name="ios_surface_elevated">#222222</color>
-	<color name="ios_surface_frosted">#CC141414</color>
-	<color name="ios_glass_bg">#CC1A1A1A</color>
+	<color name="ios_grouped_background">#000000</color>
+	<color name="ios_secondary_grouped">#0F0F0F</color>
+	<color name="ios_surface_dark">#000000</color>
+	<color name="ios_surface_card">#1C1C1E</color>
+	<color name="ios_surface_elevated">#2C2C2E</color>
+	<color name="ios_surface_frosted">#CC1C1C1E</color>
+	<color name="ios_glass_bg">#CC1C1C1E</color>
 	<color name="ios_glass_border">#33FFFFFF</color>
 
 	<!-- Text hierarchy -->
@@ -22,19 +22,19 @@
 	<color name="ios_label_secondary">#99EBEBF5</color>
 	<color name="ios_label_tertiary">#4DEBEBF5</color>
 	<color name="ios_text_primary">#FFFFFF</color>
-	<color name="ios_text_secondary">#B3FFFFFF</color>
-	<color name="ios_text_tertiary">#80FFFFFF</color>
+	<color name="ios_text_secondary">#888888</color>
+	<color name="ios_text_tertiary">#888888</color>
 
 	<!-- Borders & separators -->
 	<color name="ios_separator">#1AFFFFFF</color>
-	<color name="ios_separator_strong">#2A2A2A</color>
+	<color name="ios_separator_strong">#2C2C2E</color>
 	<color name="ios_border_subtle">#1AFFFFFF</color>
-	<color name="ios_border_card">#2A2A2A</color>
+	<color name="ios_border_card">#2C2C2E</color>
 
 	<!-- Frosted effects -->
 	<color name="ios_frosted_light">#E6FFFFFF</color>
-	<color name="ios_frosted_dark">#CC141414</color>
-	<color name="ios_frosted_amoled">#CC0A0A0A</color>
+	<color name="ios_frosted_dark">#CC1C1C1E</color>
+	<color name="ios_frosted_amoled">#CC000000</color>
 	<color name="ios_tab_bar_shadow">#1A000000</color>
 	<color name="ios_tab_bar_frosted">@color/ios_frosted_dark</color>
 	<color name="ios_search_field_bg">#1F767680</color>
