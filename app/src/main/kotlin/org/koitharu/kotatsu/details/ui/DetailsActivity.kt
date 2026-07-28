@@ -206,7 +206,7 @@ class DetailsActivity :
 		viewModel.remoteManga.observe(this, menuInvalidator)
 		viewModel.manga.observe(this) { manga ->
 			updateFloatingActionVisibility(manga)
-			menuInvalidator.onChanged(manga)
+			invalidateOptionsMenu()
 		}
 		viewModel.tags.observe(this, ::onTagsChanged)
 		viewModel.chapters.observe(this, PrefetchObserver(this))
