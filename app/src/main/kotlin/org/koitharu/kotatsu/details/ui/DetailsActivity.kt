@@ -204,7 +204,10 @@ class DetailsActivity :
 		val menuInvalidator = MenuInvalidator(this)
 		viewModel.isStatsAvailable.observe(this, menuInvalidator)
 		viewModel.remoteManga.observe(this, menuInvalidator)
-		viewModel.manga.observe(this, ::updateFloatingActionVisibility)
+		viewModel.manga.observe(this) { manga ->
+			updateFloatingActionVisibility(manga)
+			menuInvalidator.onChanged(manga)
+		}
 		viewModel.tags.observe(this, ::onTagsChanged)
 		viewModel.chapters.observe(this, PrefetchObserver(this))
 		viewModel.onDownloadStarted
