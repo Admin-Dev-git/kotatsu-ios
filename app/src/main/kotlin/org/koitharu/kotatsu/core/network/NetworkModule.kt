@@ -106,12 +106,9 @@ interface NetworkModule {
 		fun provideMangaHttpClient(
 			@BaseHttpClient baseClient: OkHttpClient,
 			commonHeadersInterceptor: CommonHeadersInterceptor,
-			tlsClientInterceptor: TlsClientInterceptor,
 		): OkHttpClient = baseClient.newBuilder().apply {
 			addNetworkInterceptor(CacheLimitInterceptor())
 			addInterceptor(commonHeadersInterceptor)
-			// Innermost: all manga sources + Coil use browser TLS fingerprints.
-			addInterceptor(tlsClientInterceptor)
 		}.build()
 
 	}
