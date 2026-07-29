@@ -157,7 +157,6 @@ class DetailsActivity :
 		supportActionBar?.setDisplayShowTitleEnabled(false)
 		setupFloatingActions()
 		viewBinding.chipFavorite.setOnClickListener(this)
-		viewBinding.chipMigrate?.setOnClickListener(this)
 		infoBinding.textViewLocal.setOnClickListener(this)
 		infoBinding.textViewSource.setOnClickListener(this)
 		viewBinding.imageViewCover.setOnClickListener(this)
@@ -259,11 +258,6 @@ class DetailsActivity :
 			R.id.chip_favorite -> {
 				val manga = viewModel.getMangaOrNull() ?: return
 				router.showFavoriteDialog(manga)
-			}
-
-			R.id.chip_migrate -> {
-				val manga = viewModel.getMangaOrNull() ?: return
-				router.openAlternatives(manga)
 			}
 
 			R.id.imageView_cover -> {
@@ -473,7 +467,6 @@ class DetailsActivity :
 			textViewNsfw16.isVisible = manga.contentRating == ContentRating.SUGGESTIVE
 			textViewNsfw18.isVisible = manga.contentRating == ContentRating.ADULT
 			textViewDescription.text = details.description.ifNullOrEmpty { getString(R.string.no_description) }
-			chipMigrate?.isVisible = manga.source != LocalMangaSource
 			if (manga.source == LocalMangaSource || manga.source == UnknownMangaSource) {
 				textViewSourceHeader?.isVisible = false
 			} else {
