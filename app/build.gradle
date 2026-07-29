@@ -32,6 +32,10 @@ android {
 			// https://issuetracker.google.com/issues/408030127
 			generateLocaleConfig false
 		}
+		ndk {
+			// Prefer 64-bit ABIs; downloadTlsNatives fetches matching .so files.
+			abiFilters 'arm64-v8a', 'x86_64'
+		}
 		def localProperties = new Properties()
 		def localPropertiesFile = rootProject.file('local.properties')
 		if (localPropertiesFile.exists()) {
@@ -71,8 +75,17 @@ android {
 		resources {
 			excludes += [
 				'META-INF/README.md',
-				'META-INF/NOTICE.md'
+				'META-INF/NOTICE.md',
+				'META-INF/DEPENDENCIES',
+				'META-INF/LICENSE',
+				'META-INF/LICENSE.txt',
+				'META-INF/NOTICE',
+				'META-INF/NOTICE.txt',
 			]
+		}
+		jniLibs {
+			// Prefer packaged jniLibs over any JNA-extracted duplicates.
+			useLegacyPackaging false
 		}
 	}
 	sourceSets {
@@ -178,6 +191,10 @@ dependencies {
 	implementation libs.okio
 	implementation libs.kotlinx.serialization.json
 
+	// Browser TLS fingerprints for all manga sources (bogdanfinn/tls-client via JNA)
+	implementation 'net.java.dev.jna:jna:5.17.0@aar'
+	implementation libs.gson
+
 	implementation libs.adapterdelegates
 	implementation libs.adapterdelegates.viewbinding
 
@@ -220,3 +237,54 @@ dependencies {
 	androidTestImplementation libs.hilt.android.testing
 	kspAndroidTest libs.hilt.android.compiler
 }
+
+// Download bogdanfinn/tls-client Android .so binaries into jniLibs before each build.
+def tlsNativesVersion = '1.15.1'
+def tlsJniLibsDir = file("$projectDir/src/main/jniLibs")
+def tlsAbiMap = [
+	'arm64-v8a': 'android-arm64-v8a',
+	'x86_64'   : 'android-x86_64',
+]
+
+tasks.register('downloadTlsNatives') {
+	group = 'build setup'
+	description = 'Download kotlin-tls-client native libraries into jniLibs'
+	outputs.dir(tlsJniLibsDir)
+
+	doLast {
+		def base = "https://github.com/PianoNic/kotlin-tls-client-natives/releases/download/v${tlsNativesVersion}"
+		tlsAbiMap.each { abi, asset ->
+			def soFile = file("$tlsJniLibsDir/$abi/libtls_client_go.so")
+			if (soFile.exists() && soFile.length() > 1_000_000) {
+				logger.lifecycle("tls-client native already present: $abi")
+				return
+			}
+			def zipFile = file("${System.getProperty('java.io.tmpdir')}/tls-natives-${asset}.zip")
+			def url = "${base}/${asset}.zip"
+			logger.lifecycle("Downloading tls-client native: $asset")
+			new URL(url).withInputStream { input ->
+				zipFile.parentFile.mkdirs()
+				zipFile.withOutputStream { output ->
+					def buf = new byte[8192]
+					int n
+					while ((n = input.read(buf)) >= 0) {
+						output.write(buf, 0, n)
+					}
+				}
+			}
+			soFile.parentFile.mkdirs()
+			copy {
+				from(zipTree(zipFile))
+				include 'libtls_client_go.so'
+				into(soFile.parentFile)
+			}
+			zipFile.delete()
+			if (!soFile.exists()) {
+				throw new GradleException("Failed to extract libtls_client_go.so for $abi")
+			}
+		}
+	}
+}
+
+tasks.named('preBuild').configure { dependsOn('downloadTlsNatives') }
+

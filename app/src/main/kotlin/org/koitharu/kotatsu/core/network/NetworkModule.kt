@@ -19,6 +19,7 @@ import org.koitharu.kotatsu.core.network.cookies.PreferencesCookieJar
 import org.koitharu.kotatsu.core.network.imageproxy.ImageProxyInterceptor
 import org.koitharu.kotatsu.core.network.imageproxy.RealImageProxyInterceptor
 import org.koitharu.kotatsu.core.network.proxy.ProxyProvider
+import org.koitharu.kotatsu.core.network.tls.TlsClientInterceptor
 import org.koitharu.kotatsu.core.prefs.AppSettings
 import org.koitharu.kotatsu.core.util.ext.assertNotInMainThread
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
@@ -105,9 +106,12 @@ interface NetworkModule {
 		fun provideMangaHttpClient(
 			@BaseHttpClient baseClient: OkHttpClient,
 			commonHeadersInterceptor: CommonHeadersInterceptor,
+			tlsClientInterceptor: TlsClientInterceptor,
 		): OkHttpClient = baseClient.newBuilder().apply {
 			addNetworkInterceptor(CacheLimitInterceptor())
 			addInterceptor(commonHeadersInterceptor)
+			// Innermost: all manga sources + Coil use browser TLS fingerprints.
+			addInterceptor(tlsClientInterceptor)
 		}.build()
 
 	}

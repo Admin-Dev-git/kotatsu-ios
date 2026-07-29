@@ -1,8 +1,6 @@
 package org.koitharu.kotatsu.core.network.webview
 
 import android.content.Context
-import android.util.AndroidRuntimeException
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.annotation.MainThread
@@ -19,6 +17,7 @@ import org.koitharu.kotatsu.core.exceptions.CloudFlareException
 import org.koitharu.kotatsu.core.network.CommonHeaders
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.core.network.proxy.ProxyProvider
+import org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity
 import org.koitharu.kotatsu.core.parser.MangaRepository
 import org.koitharu.kotatsu.core.parser.ParserMangaRepository
 import org.koitharu.kotatsu.core.util.ext.configureForParser
@@ -43,14 +42,8 @@ class WebViewExecutor @Inject constructor(
 	private var webViewCached: WeakReference<WebView>? = null
 	private val mutex = Mutex()
 
-	val defaultUserAgent: String? by lazy {
-		try {
-			WebSettings.getDefaultUserAgent(context)
-		} catch (e: AndroidRuntimeException) {
-			e.printStackTraceDebug()
-			// Probably WebView is not available
-			null
-		}
+	val defaultUserAgent: String by lazy {
+		ChromeTlsIdentity.USER_AGENT
 	}
 
 	suspend fun evaluateJs(baseUrl: String?, script: String): String? = mutex.withLock {
@@ -82,9 +75,9 @@ class WebViewExecutor @Inject constructor(
 				withContext(Dispatchers.Main.immediate) {
 					val webView = obtainWebView()
 					try {
-						exception.source.getUserAgent()?.let {
-							webView.settings.userAgentString = it
-						}
+						// Must match tls-client UA or Cloudflare rejects cf_clearance.
+						webView.settings.userAgentString =
+							exception.source.getUserAgent() ?: ChromeTlsIdentity.USER_AGENT
 						// Sync existing cookies to WebView before loading
 						syncCookiesToWebView(exception.url)
 						withTimeout(attemptTimeout) {
@@ -156,7 +149,7 @@ class WebViewExecutor @Inject constructor(
 				return@withContext it
 			}
 			WebView(context).also {
-				it.configureForParser(null)
+				it.configureForParser(ChromeTlsIdentity.USER_AGENT)
 				webViewCached = WeakReference(it)
 				proxyProvider.applyWebViewConfig()
 				it.onResume()
@@ -168,13 +161,14 @@ class WebViewExecutor @Inject constructor(
 	private fun MangaSource.getUserAgent(): String? {
 		val repository = mangaRepositoryFactoryProvider.get().create(this) as? ParserMangaRepository
 		return repository?.getRequestHeaders()?.get(CommonHeaders.USER_AGENT)
+			?: ChromeTlsIdentity.USER_AGENT
 	}
 
 	@MainThread
 	private fun WebView.reset() {
 		stopLoading()
 		webViewClient = WebViewClient()
-		settings.userAgentString = defaultUserAgent
+		settings.userAgentString = ChromeTlsIdentity.USER_AGENT
 		loadDataWithBaseURL(null, " ", "text/html", null, null)
 		clearHistory()
 	}

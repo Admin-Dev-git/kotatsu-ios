@@ -50,7 +50,7 @@ class MangaLoaderContextImpl @Inject constructor(
 		webViewExecutor.evaluateJs(baseUrl, script)
 	}
 
-	override fun getDefaultUserAgent(): String = webViewExecutor.defaultUserAgent ?: UserAgents.FIREFOX_MOBILE
+	override fun getDefaultUserAgent(): String = UserAgents.CHROME_DESKTOP
 
 	override fun getConfig(source: MangaSource): MangaSourceConfig {
 		return SourceSettings(androidContext, source)

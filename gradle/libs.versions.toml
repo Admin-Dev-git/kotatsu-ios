@@ -45,6 +45,8 @@ swiperefreshlayout = "1.1.0"
 testRules = "1.7.0"
 testRunner = "1.7.0"
 transition = "1.6.0"
+jna = "5.17.0"
+gson = "2.13.1"
 viewpager2 = "1.1.0"
 webkit = "1.14.0"
 workRuntime = "2.10.5"
@@ -117,6 +119,8 @@ okio = { module = "com.squareup.okio:okio", version.ref = "okio" }
 ssiv = { module = "com.github.KotatsuApp:subsampling-scale-image-view", version.ref = "ssiv" }
 workinspector = { module = "com.github.Koitharu:WorkInspector", version.ref = "workinspector" }
 androidx-window = { module = "androidx.window:window", version.ref = "window" }
+jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "gradle" }
