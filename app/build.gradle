@@ -286,5 +286,5 @@ tasks.register('downloadTlsNatives') {
 	}
 }
 
-tasks.named('preBuild').configure { dependsOn('downloadTlsNatives') }
+// tasks.named('preBuild').configure { dependsOn('downloadTlsNatives') }
 
