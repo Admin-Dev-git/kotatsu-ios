@@ -460,6 +460,10 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
 		get() = prefs.getBoolean(KEY_SSL_BYPASS, false)
 		set(value) = prefs.edit { putBoolean(KEY_SSL_BYPASS, value) }
 
+	var isAutoCaptchaEnabled: Boolean
+		get() = prefs.getBoolean(KEY_AUTO_CAPTCHA, true)
+		set(value) = prefs.edit { putBoolean(KEY_AUTO_CAPTCHA, value) }
+
 	val proxyType: Proxy.Type
 		get() {
 			val raw = prefs.getString(KEY_PROXY_TYPE, null) ?: return Proxy.Type.DIRECT
@@ -774,6 +778,7 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
 		const val KEY_UPDATES_UNSTABLE = "updates_unstable"
 		const val KEY_TIPS_CLOSED = "tips_closed"
 		const val KEY_SSL_BYPASS = "ssl_bypass"
+		const val KEY_AUTO_CAPTCHA = "auto_captcha"
 		const val KEY_READER_AUTOSCROLL_SPEED = "as_speed"
 		const val KEY_READER_AUTOSCROLL_FAB = "as_fab"
 		const val KEY_MIRROR_SWITCHING = "mirror_switching"
