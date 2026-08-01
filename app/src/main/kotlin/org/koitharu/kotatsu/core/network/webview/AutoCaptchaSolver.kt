@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.core.network.webview
 
 import android.content.Context
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.annotation.MainThread
@@ -38,8 +39,11 @@ import javax.inject.Singleton
  * This runs BEFORE the existing [WebViewExecutor.tryResolveCaptcha] as a first
  * line of defense. If auto-solving fails, the existing flow continues unchanged.
  *
- * Important: User-Agent must match [ChromeTlsIdentity.USER_AGENT] so any
- * `cf_clearance` cookie is accepted by subsequent OkHttp / tls-client requests.
+ * Key anti-detection measures:
+ * - WebView is given realistic screen dimensions (0x0 is an instant bot signal)
+ * - Stealth script masks navigator.webdriver, adds window.chrome, fixes plugins/languages
+ * - User-Agent matches [ChromeTlsIdentity.USER_AGENT] so cf_clearance is accepted
+ * - Original request headers (Referer, etc.) are forwarded to the challenge page
  */
 @Singleton
 class AutoCaptchaSolver @Inject constructor(
@@ -79,7 +83,16 @@ class AutoCaptchaSolver @Inject constructor(
 									targetUrl = exception.url,
 									continuation = cont,
 								)
-								webView.loadUrl(exception.url)
+								// Forward original request headers (Referer, etc.)
+								val extraHeaders = buildExtraHeaders(exception)
+								if (extraHeaders.isEmpty()) {
+									webView.loadUrl(exception.url)
+								} else {
+									webView.loadUrl(exception.url, extraHeaders)
+								}
+								// Inject stealth script immediately after loadUrl to mask
+								// bot fingerprints before the page's own scripts execute.
+								webView.evaluateJavascript(CaptchaSolverScript.STEALTH_SCRIPT, null)
 							}
 						}
 						// Persist and pull clearance back into OkHttp CookieJar.
@@ -101,6 +114,19 @@ class AutoCaptchaSolver @Inject constructor(
 	}
 
 	/**
+	 * Build extra headers to forward from the original failed request to the WebView.
+	 * Only forwards safe/useful headers — CloudFlare may reject mismatched headers.
+	 */
+	private fun buildExtraHeaders(exception: CloudFlareProtectedException): Map<String, String> {
+		val headers = mutableMapOf<String, String>()
+		// Forward Referer if present — some sources require it
+		exception.headers["Referer"]?.let { headers["Referer"] = it }
+		// Forward Accept-Language if present
+		exception.headers["Accept-Language"]?.let { headers["Accept-Language"] = it }
+		return headers
+	}
+
+	/**
 	 * Sync cookies from OkHttp CookieJar to Android WebView CookieManager
 	 * so the WebView starts with any existing session cookies.
 	 */
@@ -117,15 +143,29 @@ class AutoCaptchaSolver @Inject constructor(
 	/**
 	 * Sync cookies from Android WebView CookieManager back to OkHttp CookieJar
 	 * so cf_clearance (and related CF session cookies) are available to network calls.
+	 *
+	 * Constructs cookies with explicit domain/path to ensure they match subsequent
+	 * requests to the same domain (including subdomains).
 	 */
 	private fun syncCookiesFromWebView(url: String) {
 		val httpUrl = url.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
 		val cookieString = cookieManager.getCookie(url) ?: return
+		val domain = httpUrl.host
 		val cookies = cookieString.split(";").mapNotNull { raw ->
 			val trimmed = raw.trim()
 			if (trimmed.isEmpty()) return@mapNotNull null
-			Cookie.parse(httpUrl, trimmed)
+			val eqIndex = trimmed.indexOf('=')
+			if (eqIndex <= 0) return@mapNotNull null
+			val name = trimmed.substring(0, eqIndex).trim()
+			val value = trimmed.substring(eqIndex + 1).trim()
+			Cookie.Builder()
+				.name(name)
+				.value(value)
+				.domain(domain)
+				.path("/")
+				.secure()
+				.build()
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)
@@ -142,6 +182,13 @@ class AutoCaptchaSolver @Inject constructor(
 			}
 			WebView(context).also {
 				it.configureForParser(ChromeTlsIdentity.USER_AGENT)
+				// Set WebChromeClient — required for some JS challenge operations
+				// (console messages, JS dialogs, etc.)
+				it.webChromeClient = WebChromeClient()
+				// Give the WebView realistic dimensions. A 0x0 WebView is an
+				// instant bot detection signal for CloudFlare Turnstile.
+				val displayMetrics = context.resources.displayMetrics
+				it.layout(0, 0, displayMetrics.widthPixels, displayMetrics.heightPixels)
 				webViewCached = WeakReference(it)
 				proxyProvider.applyWebViewConfig()
 				it.onResume()
@@ -166,7 +213,7 @@ class AutoCaptchaSolver @Inject constructor(
 	}
 
 	companion object {
-		private const val MAX_SOLVE_ATTEMPTS = 2
+		private const val MAX_SOLVE_ATTEMPTS = 3
 		private const val RETRY_TIMEOUT_INCREMENT = 5_000L
 	}
 }

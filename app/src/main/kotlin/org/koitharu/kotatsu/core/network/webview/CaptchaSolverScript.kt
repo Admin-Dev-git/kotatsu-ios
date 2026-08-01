@@ -7,10 +7,98 @@ package org.koitharu.kotatsu.core.network.webview
  * Notes on modern CloudFlare:
  * - Many Managed Challenges complete purely via JS fingerprinting (no click needed).
  * - Turnstile widgets are cross-origin iframes; contentDocument is usually inaccessible.
- * - We therefore combine: synthetic pointer events on widgets, label/checkbox clicks,
- *   shadow-DOM probing, form submits, and a continuous retry loop for late-mounted widgets.
+ * - We therefore combine: stealth anti-detection, synthetic pointer events on widgets,
+ *   label/checkbox clicks, shadow-DOM probing, form submits, and a continuous retry loop.
  */
 internal object CaptchaSolverScript {
+
+	/**
+	 * Anti-detection stealth script. Must be injected BEFORE the page's own scripts run
+	 * (i.e., as early as possible — ideally right after [WebView.loadUrl]).
+	 *
+	 * Masks common bot fingerprints that CloudFlare Turnstile checks:
+	 * - navigator.webdriver (true in automated WebViews)
+	 * - Missing window.chrome object
+	 * - Empty navigator.plugins
+	 * - Missing navigator.languages
+	 * - Unrealistic hardwareConcurrency / deviceMemory
+	 * - Permissions API inconsistencies
+	 */
+	val STEALTH_SCRIPT: String = """
+		(function() {
+			try {
+				// Mask navigator.webdriver — the #1 bot detection signal
+				Object.defineProperty(navigator, 'webdriver', {
+					get: () => undefined,
+					configurable: true
+				});
+
+				// Add window.chrome object (present in real Chrome, absent in WebView)
+				if (!window.chrome) {
+					window.chrome = {
+						runtime: {},
+						loadTimes: function() { return {}; },
+						csi: function() { return {}; },
+						app: {}
+					};
+				}
+
+				// Fix navigator.plugins — real Chrome has plugins, headless has none
+				Object.defineProperty(navigator, 'plugins', {
+					get: () => {
+						var arr = [1, 2, 3, 4, 5];
+						arr.item = function(i) { return this[i]; };
+						arr.namedItem = function(name) { return null; };
+						arr.refresh = function() {};
+						return arr;
+					},
+					configurable: true
+				});
+
+				// Fix navigator.languages — must be non-empty
+				Object.defineProperty(navigator, 'languages', {
+					get: () => ['en-US', 'en'],
+					configurable: true
+				});
+
+				// Realistic hardware concurrency (most phones have 8 cores)
+				Object.defineProperty(navigator, 'hardwareConcurrency', {
+					get: () => 8,
+					configurable: true
+				});
+
+				// Realistic device memory (8GB)
+				Object.defineProperty(navigator, 'deviceMemory', {
+					get: () => 8,
+					configurable: true
+				});
+
+				// Fix permissions API — CloudFlare checks notification permission
+				if (navigator.permissions && navigator.permissions.query) {
+					var originalQuery = navigator.permissions.query.bind(navigator.permissions);
+					navigator.permissions.query = function(params) {
+						if (params && params.name === 'notifications') {
+							return Promise.resolve({ state: 'prompt', onchange: null });
+						}
+						return originalQuery(params);
+					};
+				}
+
+				// Mask toString overrides so detection can't find our patches
+				var originalToString = Function.prototype.toString;
+				Function.prototype.toString = function() {
+					if (this === navigator.permissions.query) {
+						return 'function query() { [native code] }';
+					}
+					return originalToString.call(this);
+				};
+
+				return 'stealth_applied';
+			} catch (e) {
+				return 'stealth_error: ' + (e && e.message ? e.message : String(e));
+			}
+		})();
+	""".trimIndent()
 
 	/**
 	 * One-shot auto-solve pass. Returns a string status for debugging.
@@ -64,7 +152,9 @@ internal object CaptchaSolverScript {
 					'iframe[src*="turnstile"], ' +
 					'iframe[title*="Cloudflare"], ' +
 					'iframe[title*="Widget containing a Cloudflare"], ' +
-					'div.cf-turnstile, div#turnstile-wrapper, div[id*="cf-turnstile"]'
+					'div.cf-turnstile, div#turnstile-wrapper, div[id*="cf-turnstile"], ' +
+					'div.cf-turnstile-wrapper, ' +
+					'[data-turnstile-sitekey], [data-sitekey]'
 				);
 				for (var i = 0; i < turnstileHosts.length; i++) {
 					var host = turnstileHosts[i];
@@ -99,7 +189,8 @@ internal object CaptchaSolverScript {
 					'.challenge-form input[type="checkbox"], ' +
 					'#cf-challenge input[type="checkbox"], ' +
 					'label.ctp-checkbox-label, ' +
-					'[name="cf-turnstile-response"]'
+					'[name="cf-turnstile-response"], ' +
+					'input[name="cf-turnstile-response"]'
 				);
 				if (challengeCheckbox) {
 					// For labels, also try the associated input
@@ -150,7 +241,8 @@ internal object CaptchaSolverScript {
 
 				// Strategy 5: Auto-submit challenge forms
 				var forms = document.querySelectorAll(
-					'form#challenge-form, form.challenge-form, form[action*="challenge"], form[action*="__cf_chl"]'
+					'form#challenge-form, form.challenge-form, form[action*="challenge"], ' +
+					'form[action*="__cf_chl"], form[action*="cdn-cgi/challenge"]'
 				);
 				for (var k = 0; k < forms.length; k++) {
 					var submitBtn = forms[k].querySelector(
@@ -209,10 +301,13 @@ internal object CaptchaSolverScript {
 						document.querySelector('#cf-please-wait') ||
 						document.querySelector('div.cf-turnstile') ||
 						document.querySelector('div#turnstile-wrapper') ||
+						document.querySelector('div.cf-turnstile-wrapper') ||
 						document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
 						document.querySelector('iframe[src*="turnstile"]') ||
 						document.querySelector('#challenge-error-title') ||
 						document.querySelector('.ctp-checkbox-label') ||
+						document.querySelector('[data-turnstile-sitekey]') ||
+						document.querySelector('input[name="cf-turnstile-response"]') ||
 						(document.title && (
 							document.title.toLowerCase().indexOf('just a moment') !== -1 ||
 							document.title.toLowerCase().indexOf('attention required') !== -1
@@ -230,13 +325,12 @@ internal object CaptchaSolverScript {
 					return;
 				}
 				try {
-					// Re-run the one-shot solver body inline to avoid depending on prior eval state
-					var s = document.createElement('script');
-					// Directly invoke click strategies via a minimal subset
 					var hosts = document.querySelectorAll(
 						'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], ' +
-						'div.cf-turnstile, div#turnstile-wrapper, .ctp-checkbox-label, ' +
-						'#challenge-stage input[type="checkbox"], #challenge-stage .ctp-checkbox-label'
+						'div.cf-turnstile, div#turnstile-wrapper, div.cf-turnstile-wrapper, ' +
+						'.ctp-checkbox-label, ' +
+						'#challenge-stage input[type="checkbox"], #challenge-stage .ctp-checkbox-label, ' +
+						'[data-turnstile-sitekey], [data-sitekey]'
 					);
 					for (var i = 0; i < hosts.length; i++) {
 						try { hosts[i].click(); } catch (e) {}
@@ -271,6 +365,7 @@ internal object CaptchaSolverScript {
 					document.querySelector('div#turnstile-wrapper') ||
 					document.querySelector('div.cf-turnstile') ||
 					document.querySelector('div[id*="cf-turnstile"]') ||
+					document.querySelector('div.cf-turnstile-wrapper') ||
 					document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
 					document.querySelector('iframe[src*="turnstile"]') ||
 					document.querySelector('script[src*="challenges.cloudflare.com"]') ||
@@ -279,6 +374,10 @@ internal object CaptchaSolverScript {
 					document.querySelector('#challenge-error-text') ||
 					document.querySelector('.ctp-checkbox-label') ||
 					document.querySelector('form[action*="__cf_chl"]') ||
+					document.querySelector('form[action*="cdn-cgi/challenge"]') ||
+					document.querySelector('input[name="cf-turnstile-response"]') ||
+					document.querySelector('[data-turnstile-sitekey]') ||
+					document.querySelector('div[data-sitekey]') ||
 					title.indexOf('just a moment') !== -1 ||
 					title.indexOf('attention required') !== -1 ||
 					title.indexOf('cloudflare') !== -1 ||

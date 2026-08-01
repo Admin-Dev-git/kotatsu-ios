@@ -19,11 +19,12 @@ import kotlin.coroutines.resume
  * A [WebViewClient] that automatically solves CloudFlare JS challenges.
  *
  * On each page load it:
- * 1. Syncs WebView cookies into OkHttp and checks if `cf_clearance` changed
- * 2. If not solved, injects [CaptchaSolverScript] (detect + continuous solve loop)
- * 3. Polls for clearance every [COOKIE_CHECK_INTERVAL] ms (Turnstile often sets
+ * 1. Injects stealth anti-detection script on page start (before page scripts run)
+ * 2. Syncs WebView cookies into OkHttp and checks if `cf_clearance` changed
+ * 3. If not solved, injects [CaptchaSolverScript] (detect + continuous solve loop)
+ * 4. Polls for clearance every [COOKIE_CHECK_INTERVAL] ms (Turnstile often sets
  *    the cookie without further navigation events)
- * 4. Resumes the continuation when the challenge is solved
+ * 5. Resumes the continuation when the challenge is solved
  */
 internal class AutoCaptchaWebViewClient(
 	private val cookieJar: MutableCookieJar,
@@ -58,6 +59,9 @@ internal class AutoCaptchaWebViewClient(
 	override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
 		super.onPageStarted(view, url, favicon)
 		webViewRef = view
+		// Inject stealth script on every page start to ensure it's active
+		// before any page scripts execute (CloudFlare checks fingerprints early).
+		view?.let { injectStealthScript(it) }
 		syncCookiesFromWebView()
 		if (isClearanceObtained()) {
 			resumeOnce(view)
@@ -95,6 +99,19 @@ internal class AutoCaptchaWebViewClient(
 	private fun isClearanceObtained(): Boolean {
 		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
 		return clearance != null && clearance != oldClearance
+	}
+
+	/**
+	 * Inject the stealth anti-detection script. This masks bot fingerprints
+	 * (navigator.webdriver, missing window.chrome, empty plugins, etc.)
+	 * that CloudFlare Turnstile checks before presenting the challenge.
+	 */
+	private fun injectStealthScript(webView: WebView) {
+		try {
+			webView.evaluateJavascript(CaptchaSolverScript.STEALTH_SCRIPT, null)
+		} catch (e: Exception) {
+			e.printStackTraceDebug()
+		}
 	}
 
 	private fun maybeReinjectSolver(webView: WebView) {
@@ -149,15 +166,29 @@ internal class AutoCaptchaWebViewClient(
 	/**
 	 * Sync cookies from Android WebView CookieManager back into OkHttp's CookieJar.
 	 * Without this, [isClearanceObtained] never sees `cf_clearance` set by the WebView.
+	 *
+	 * Constructs cookies with explicit domain/path to ensure they match subsequent
+	 * requests to the same domain (including subdomains).
 	 */
 	private fun syncCookiesFromWebView() {
 		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
 		val cookieString = cookieManager.getCookie(targetUrl) ?: return
+		val domain = httpUrl.host
 		val cookies = cookieString.split(";").mapNotNull { raw ->
 			val trimmed = raw.trim()
 			if (trimmed.isEmpty()) return@mapNotNull null
-			Cookie.parse(httpUrl, trimmed)
+			val eqIndex = trimmed.indexOf('=')
+			if (eqIndex <= 0) return@mapNotNull null
+			val name = trimmed.substring(0, eqIndex).trim()
+			val value = trimmed.substring(eqIndex + 1).trim()
+			Cookie.Builder()
+				.name(name)
+				.value(value)
+				.domain(domain)
+				.path("/")
+				.secure()
+				.build()
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)
