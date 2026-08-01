@@ -1,9 +1,14 @@
 package org.koitharu.kotatsu.core.network.webview
 
 import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
+import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.CancellableContinuation
+import okhttp3.Cookie
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
 import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
@@ -14,9 +19,11 @@ import kotlin.coroutines.resume
  * A [WebViewClient] that automatically solves CloudFlare JS challenges.
  *
  * On each page load it:
- * 1. Checks if the `cf_clearance` cookie has changed (challenge solved)
- * 2. If not solved, injects [CaptchaSolverScript.SOLVE_SCRIPT] to auto-click challenge elements
- * 3. Resumes the continuation when the challenge is solved
+ * 1. Syncs WebView cookies into OkHttp and checks if `cf_clearance` changed
+ * 2. If not solved, injects [CaptchaSolverScript] (detect + continuous solve loop)
+ * 3. Polls for clearance every [COOKIE_CHECK_INTERVAL] ms (Turnstile often sets
+ *    the cookie without further navigation events)
+ * 4. Resumes the continuation when the challenge is solved
  */
 internal class AutoCaptchaWebViewClient(
 	private val cookieJar: MutableCookieJar,
@@ -25,57 +32,113 @@ internal class AutoCaptchaWebViewClient(
 ) : WebViewClient() {
 
 	private val oldClearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
+	private val handler = Handler(Looper.getMainLooper())
+	private var webViewRef: WebView? = null
 
 	@Volatile
 	private var scriptInjectCount = 0
 
+	@Volatile
+	private var continuousLoopStarted = false
+
+	private val cookieCheckRunnable: Runnable = object : Runnable {
+		override fun run() {
+			if (isResumed) return
+			syncCookiesFromWebView()
+			if (isClearanceObtained()) {
+				resumeOnce(webViewRef)
+			} else {
+				// Re-inject solver periodically — widgets often mount late.
+				webViewRef?.let { maybeReinjectSolver(it) }
+				handler.postDelayed(this, COOKIE_CHECK_INTERVAL)
+			}
+		}
+	}
+
 	override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
 		super.onPageStarted(view, url, favicon)
-		checkClearance(view)
+		webViewRef = view
+		syncCookiesFromWebView()
+		if (isClearanceObtained()) {
+			resumeOnce(view)
+			return
+		}
+		// Start periodic cookie polling to catch Turnstile solutions.
+		handler.removeCallbacks(cookieCheckRunnable)
+		handler.postDelayed(cookieCheckRunnable, COOKIE_CHECK_INTERVAL)
 	}
 
 	override fun onPageFinished(view: WebView?, url: String?) {
 		super.onPageFinished(view, url)
 		if (isResumed) return
 
-		// Check clearance first — the page might have already solved the challenge
-		checkClearance(view)
-		if (isResumed) return
+		webViewRef = view
+		syncCookiesFromWebView()
+		if (isClearanceObtained()) {
+			resumeOnce(view)
+			return
+		}
 
-		// Inject the auto-solve script
-		view?.let { injectSolverScript(it) }
+		// Inject the auto-solve script (and start continuous loop if needed).
+		view?.let { injectSolverScript(it, forceContinuous = true) }
 	}
 
 	override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
 		super.doUpdateVisitedHistory(view, url, isReload)
-		// URL changed — check if we got redirected after solving
-		checkClearance(view)
-	}
-
-	private fun checkClearance(view: WebView?) {
-		if (isResumed) return
-		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
-		if (clearance != null && clearance != oldClearance) {
+		// URL changed — often means challenge redirect completed.
+		syncCookiesFromWebView()
+		if (isClearanceObtained()) {
 			resumeOnce(view)
 		}
 	}
 
-	private fun injectSolverScript(webView: WebView) {
+	private fun isClearanceObtained(): Boolean {
+		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
+		return clearance != null && clearance != oldClearance
+	}
+
+	private fun maybeReinjectSolver(webView: WebView) {
+		if (isResumed) return
 		if (scriptInjectCount >= MAX_SCRIPT_INJECTIONS) return
+		// Light re-inject of one-shot click strategies without restarting the loop.
 		scriptInjectCount++
+		try {
+			webView.evaluateJavascript(CaptchaSolverScript.SOLVE_SCRIPT, null)
+		} catch (e: Exception) {
+			e.printStackTraceDebug()
+		}
+	}
+
+	private fun injectSolverScript(webView: WebView, forceContinuous: Boolean) {
+		if (isResumed) return
+		if (scriptInjectCount >= MAX_SCRIPT_INJECTIONS && continuousLoopStarted) return
 
 		try {
-			// First check if this is actually a challenge page
 			webView.evaluateJavascript(CaptchaSolverScript.DETECT_CHALLENGE_SCRIPT) { result ->
+				if (isResumed) return@evaluateJavascript
 				val isChallenge = result?.contains("true") == true
-				if (isChallenge) {
-					// Inject the solver script
-					webView.evaluateJavascript(CaptchaSolverScript.SOLVE_SCRIPT) { solveResult ->
-						// After solving attempt, check clearance again
-						webView.postDelayed({
-							checkClearance(webView)
-						}, SOLVE_CHECK_DELAY_MS)
+				if (!isChallenge) {
+					// Page may already have passed; re-check cookies once more.
+					syncCookiesFromWebView()
+					if (isClearanceObtained()) {
+						resumeOnce(webView)
 					}
+					return@evaluateJavascript
+				}
+
+				scriptInjectCount++
+				// One-shot click attempt (covers managed checkbox / verify buttons).
+				webView.evaluateJavascript(CaptchaSolverScript.SOLVE_SCRIPT) {
+					syncCookiesFromWebView()
+					if (isClearanceObtained()) {
+						resumeOnce(webView)
+					}
+				}
+
+				// Continuous loop handles delayed Turnstile widget mounts & re-tries.
+				if (forceContinuous && !continuousLoopStarted) {
+					continuousLoopStarted = true
+					webView.evaluateJavascript(CaptchaSolverScript.CONTINUOUS_SOLVE_SCRIPT, null)
 				}
 			}
 		} catch (e: Exception) {
@@ -83,13 +146,34 @@ internal class AutoCaptchaWebViewClient(
 		}
 	}
 
+	/**
+	 * Sync cookies from Android WebView CookieManager back into OkHttp's CookieJar.
+	 * Without this, [isClearanceObtained] never sees `cf_clearance` set by the WebView.
+	 */
+	private fun syncCookiesFromWebView() {
+		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return
+		val cookieManager = CookieManager.getInstance()
+		val cookieString = cookieManager.getCookie(targetUrl) ?: return
+		val cookies = cookieString.split(";").mapNotNull { raw ->
+			val trimmed = raw.trim()
+			if (trimmed.isEmpty()) return@mapNotNull null
+			Cookie.parse(httpUrl, trimmed)
+		}
+		if (cookies.isNotEmpty()) {
+			cookieJar.saveFromResponse(httpUrl, cookies)
+		}
+	}
+
 	private val isResumed: Boolean
 		get() = continuation is CancellableContinuation && !continuation.isActive
 
 	private fun resumeOnce(view: WebView?) {
+		if (isResumed) return
+		handler.removeCallbacks(cookieCheckRunnable)
+		syncCookiesFromWebView()
 		if (continuation is CancellableContinuation) {
 			if (continuation.isActive) {
-				view?.webViewClient = WebViewClient() // reset to default
+				view?.webViewClient = WebViewClient() // stop further callbacks
 				continuation.resume(Unit)
 			}
 		} else {
@@ -99,7 +183,7 @@ internal class AutoCaptchaWebViewClient(
 	}
 
 	companion object {
-		private const val MAX_SCRIPT_INJECTIONS = 10
-		private const val SOLVE_CHECK_DELAY_MS = 2_000L
+		private const val MAX_SCRIPT_INJECTIONS = 20
+		private const val COOKIE_CHECK_INTERVAL = 500L
 	}
 }

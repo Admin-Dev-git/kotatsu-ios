@@ -299,6 +299,7 @@ class CaptchaHandler @Inject constructor(
 		private const val SETTINGS_ACTION_CODE = 3
 		private const val ACTION_DISCARD = "org.koitharu.kotatsu.CAPTCHA_DISCARD"
 		private const val RESOLVE_TIMEOUT = 45_000L
-		private const val AUTO_SOLVE_TIMEOUT = 30_000L
+		/** Timeout for [AutoCaptchaSolver] first-line attempt (Turnstile often needs 20–35s). */
+		private const val AUTO_SOLVE_TIMEOUT = 35_000L
 	}
 }
