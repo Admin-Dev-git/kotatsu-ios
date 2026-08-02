@@ -29,6 +29,7 @@ import kotlin.coroutines.resume
 internal class AutoCaptchaWebViewClient(
 	private val cookieJar: MutableCookieJar,
 	private val targetUrl: String,
+	private val userAgent: String,
 	private val continuation: Continuation<Unit>,
 ) : WebViewClient() {
 
@@ -108,7 +109,7 @@ internal class AutoCaptchaWebViewClient(
 	 */
 	private fun injectStealthScript(webView: WebView) {
 		try {
-			webView.evaluateJavascript(CaptchaSolverScript.STEALTH_SCRIPT, null)
+			webView.evaluateJavascript(CaptchaSolverScript.stealthScript(userAgent), null)
 		} catch (e: Exception) {
 			e.printStackTraceDebug()
 		}

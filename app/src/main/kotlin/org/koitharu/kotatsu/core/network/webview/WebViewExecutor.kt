@@ -10,6 +10,9 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import androidx.annotation.MainThread
+import androidx.webkit.ScriptHandler
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -46,6 +49,7 @@ class WebViewExecutor @Inject constructor(
 ) {
 
 	private var webViewCached: WeakReference<WebView>? = null
+	private var startScriptHandler: ScriptHandler? = null
 	private val mutex = Mutex()
 
 	@Volatile
@@ -121,8 +125,11 @@ class WebViewExecutor @Inject constructor(
 					val webView = obtainWebView()
 					try {
 						// Must match tls-client UA or Cloudflare rejects cf_clearance.
-						webView.settings.userAgentString =
-							exception.source.getUserAgent() ?: ChromeTlsIdentity.USER_AGENT
+						val userAgent = exception.source.getUserAgent() ?: ChromeTlsIdentity.USER_AGENT
+						webView.settings.userAgentString = userAgent
+						// Stealth at document-start so Cloudflare's challenge scripts read a
+						// consistent Windows Chrome 133 identity instead of the real Android one.
+						installDocumentStartStealth(webView, userAgent)
 						// Sync existing cookies to WebView before loading
 						syncCookiesToWebView(exception.url)
 						withTimeout(attemptTimeout) {
@@ -139,6 +146,8 @@ class WebViewExecutor @Inject constructor(
 						android.webkit.CookieManager.getInstance().flush()
 						syncCookiesFromWebView(exception.url)
 					} finally {
+						startScriptHandler?.remove()
+						startScriptHandler = null
 						webView.reset()
 					}
 				}
@@ -217,18 +226,42 @@ class WebViewExecutor @Inject constructor(
 	@MainThread
 	private fun attachToWindow(webView: WebView) {
 		val activity = topActivity ?: return
-		val root = (activity.window?.decorView as? ViewGroup) ?: return
-		if (root.isAttachedToWindow.not()) return
+		val content = (activity.findViewById<android.view.View>(android.R.id.content) as? ViewGroup)
+			?: (activity.window?.decorView as? ViewGroup)
+			?: return
+		if (content.isAttachedToWindow.not()) return
 		val parent = webView.parent
-		if (parent === root) return
+		if (parent === content) return
 		(parent as? ViewGroup)?.removeView(webView)
 		try {
+			// Place BEHIND the app's own content: fully composited (so the page reports
+			// document.visibilityState = "visible" and rAF fires) but visually covered by
+			// the opaque app UI. alpha=0.01 is a fallback cloak in case the app content is
+			// translucent, while still rendering to Turnstile.
 			webView.alpha = INVISIBLE_ALPHA
 			webView.visibility = android.view.View.VISIBLE
-			root.addView(webView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+			content.addView(webView, 0, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
 		} catch (e: Exception) {
 			e.printStackTraceDebug()
 		}
+	}
+
+	/**
+	 * Inject [CaptchaSolverScript.stealthScript] at document-start so it executes before
+	 * the page's own scripts (and inside cross-origin Turnstile iframes).
+	 */
+	@MainThread
+	private fun installDocumentStartStealth(webView: WebView, userAgent: String) {
+		startScriptHandler?.remove()
+		startScriptHandler = null
+		if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
+		runCatching {
+			startScriptHandler = WebViewCompat.addDocumentStartJavaScript(
+				webView,
+				CaptchaSolverScript.stealthScript(userAgent),
+				setOf("*"),
+			)
+		}.onFailure { it.printStackTraceDebug() }
 	}
 
 	private fun MangaSource.getUserAgent(): String? {

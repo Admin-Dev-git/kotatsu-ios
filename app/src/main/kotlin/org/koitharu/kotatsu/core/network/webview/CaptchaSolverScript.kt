@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.core.network.webview
 
+import org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity
+
 /**
  * JavaScript code injected into the WebView to automatically solve
  * CloudFlare JS challenges (Turnstile, Managed Challenge, and generic checkbox challenges).
@@ -9,88 +11,199 @@ package org.koitharu.kotatsu.core.network.webview
  * - Turnstile widgets are cross-origin iframes; contentDocument is usually inaccessible.
  * - We therefore combine: stealth anti-detection, synthetic pointer events on widgets,
  *   label/checkbox clicks, shadow-DOM probing, form submits, and a continuous retry loop.
+ *
+ * The stealth script is critical: the OkHttp stack impersonates a Windows desktop
+ * Chrome 133 (TLS-PSK profile + Windows UA). The system WebView, however, runs on
+ * Android and leaks `navigator.platform` ("Linux aarch64"), `navigator.userAgentData`
+ * (mobile), WebGL renderer (Mali/Adreno), screen dimensions and touch points — all of
+ * which Cloudflare correlates with the UA and flags as a bot. [stealthScript] rewrites
+ * every one of those signals to form a self-consistent Windows Chrome 133 identity and
+ * is injected at document-start (before any page script, in every frame).
  */
 internal object CaptchaSolverScript {
 
 	/**
-	 * Anti-detection stealth script. Must be injected BEFORE the page's own scripts run
-	 * (i.e., as early as possible — ideally right after [WebView.loadUrl]).
+	 * Anti-detection stealth script tailored to [userAgent]. Masks every JS signal
+	 * Cloudflare Turnstile correlates against the User-Agent so the WebView looks like
+	 * the same browser the OkHttp stack claims to be.
 	 *
-	 * Masks common bot fingerprints that CloudFlare Turnstile checks:
-	 * - navigator.webdriver (true in automated WebViews)
-	 * - Missing window.chrome object
-	 * - Empty navigator.plugins
-	 * - Missing navigator.languages
-	 * - Unrealistic hardwareConcurrency / deviceMemory
-	 * - Permissions API inconsistencies
+	 * Must be injected at document-start (e.g. via
+	 * [androidx.webkit.WebViewCompat.addDocumentStartJavaScript]) so it runs before the
+	 * page's own scripts read the real (Android) fingerprints.
 	 */
-	val STEALTH_SCRIPT: String = """
+	fun stealthScript(userAgent: String): String = buildStealthScript(userAgent)
+
+	/** Backwards-compatible constant — uses the canonical Windows Chrome 133 UA. */
+	@Suppress("ObjectPropertyName")
+	val STEALTH_SCRIPT: String = stealthScript(ChromeTlsIdentity.USER_AGENT)
+
+	private fun buildStealthScript(ua: String): String = """
 		(function() {
 			try {
-				// Mask navigator.webdriver — the #1 bot detection signal
-				Object.defineProperty(navigator, 'webdriver', {
-					get: () => undefined,
-					configurable: true
-				});
+				var reportedUA = ${'$'}{JSON.stringify(ua)};
 
-				// Add window.chrome object (present in real Chrome, absent in WebView)
-				if (!window.chrome) {
-					window.chrome = {
-						runtime: {},
-						loadTimes: function() { return {}; },
-						csi: function() { return {}; },
-						app: {}
-					};
+				// Resolve a platform / client-hints identity consistent with the UA.
+				var platform, chPlatform, mobile;
+				if (reportedUA.indexOf('Windows') !== -1) {
+					platform = 'Win32'; chPlatform = 'Windows'; mobile = false;
+				} else if (reportedUA.indexOf('Macintosh') !== -1 || reportedUA.indexOf('Mac OS X') !== -1) {
+					platform = 'MacIntel'; chPlatform = 'macOS'; mobile = false;
+				} else if (reportedUA.indexOf('Android') !== -1) {
+					platform = 'Linux armv8l'; chPlatform = 'Android'; mobile = true;
+				} else if (reportedUA.indexOf('iPhone') !== -1 || reportedUA.indexOf('iPad') !== -1) {
+					platform = 'iPhone'; chPlatform = 'iOS'; mobile = true;
+				} else {
+					platform = 'Linux x86_64'; chPlatform = 'Linux';
+					mobile = reportedUA.indexOf('Mobile') !== -1;
 				}
 
-				// Fix navigator.plugins — real Chrome has plugins, headless has none
-				Object.defineProperty(navigator, 'plugins', {
-					get: () => {
-						var arr = [1, 2, 3, 4, 5];
-						arr.item = function(i) { return this[i]; };
-						arr.namedItem = function(name) { return null; };
-						arr.refresh = function() {};
-						return arr;
-					},
-					configurable: true
-				});
+				// Define a getter on the prototype first (intercepts even
+				// Object.getOwnPropertyDescriptor(proto, prop).get.call(navigator) bypasses)
+				// and fall back to an own property on the navigator instance.
+				var navProto = (window.Navigator && Navigator.prototype) || null;
+				function defineGetter(obj, prop, getter) {
+					try { Object.defineProperty(obj, prop, { get: getter, configurable: true }); return true; }
+					catch (e) { return false; }
+				}
+				function defineNav(prop, getter) {
+					if (navProto) { if (defineGetter(navProto, prop, getter)) return; }
+					defineGetter(navigator, prop, getter);
+				}
+				function defineConst(obj, prop, value) {
+					try { Object.defineProperty(obj, prop, { get: function(){ return value; }, configurable: true }); }
+					catch (e) {}
+				}
 
-				// Fix navigator.languages — must be non-empty
-				Object.defineProperty(navigator, 'languages', {
-					get: () => ['en-US', 'en'],
-					configurable: true
-				});
+				// navigator.webdriver — the #1 bot detection signal
+				defineNav('webdriver', function() { return undefined; });
 
-				// Realistic hardware concurrency (most phones have 8 cores)
-				Object.defineProperty(navigator, 'hardwareConcurrency', {
-					get: () => 8,
-					configurable: true
+				// navigator.userAgent/appVersion — WebSettings already spoofs userAgent,
+				// but redefine for belts-and-braces consistency.
+				defineNav('userAgent', function() { return reportedUA; });
+				defineNav('appVersion', function() {
+					var i = reportedUA.indexOf('Mozilla/');
+					return i === -1 ? reportedUA : reportedUA.substring(i + 'Mozilla/'.length);
 				});
+				defineNav('platform', function() { return platform; });
+				defineNav('vendor', function() { return 'Google Inc.'; });
+				defineNav('maxTouchPoints', function() { return mobile ? 5 : 0; });
 
-				// Realistic device memory (8GB)
-				Object.defineProperty(navigator, 'deviceMemory', {
-					get: () => 8,
-					configurable: true
+				// window.chrome — present in real Chrome, absent in plain WebView.
+				if (!window.chrome) {
+					window.chrome = {
+						runtime: {}, app: {},
+						loadTimes: function() { return {}; },
+						csi: function() { return {}; }
+					};
+				} else if (!window.chrome.runtime) {
+					window.chrome.runtime = {};
+				}
+
+				// navigator.plugins — real Chrome has plugins, headless has none.
+				defineNav('plugins', function() {
+					var a = [1, 2, 3, 4, 5];
+					a.item = function(i) { return this[i]; };
+					a.namedItem = function() { return null; };
+					a.refresh = function() {};
+					return a;
 				});
+				defineNav('languages', function() { return ['en-US', 'en']; });
+				defineNav('hardwareConcurrency', function() { return 8; });
+				defineNav('deviceMemory', function() { return 8; });
 
-				// Fix permissions API — CloudFlare checks notification permission
+				// Permissions API — Cloudflare probes the notification permission.
 				if (navigator.permissions && navigator.permissions.query) {
-					var originalQuery = navigator.permissions.query.bind(navigator.permissions);
+					var origQuery = navigator.permissions.query.bind(navigator.permissions);
 					navigator.permissions.query = function(params) {
 						if (params && params.name === 'notifications') {
 							return Promise.resolve({ state: 'prompt', onchange: null });
 						}
-						return originalQuery(params);
+						return origQuery(params);
 					};
 				}
 
-				// Mask toString overrides so detection can't find our patches
-				var originalToString = Function.prototype.toString;
-				Function.prototype.toString = function() {
-					if (this === navigator.permissions.query) {
-						return 'function query() { [native code] }';
+				// navigator.userAgentData (Client Hints) — strongly checked by Turnstile.
+				try {
+					var m = reportedUA.match(/Chrome\/(\d+)/);
+					var major = (m && m[1]) ? m[1] : '133';
+					var brands = [
+						{ brand: 'Not(A:Brand', version: '99' },
+						{ brand: 'Google Chrome', version: major },
+						{ brand: 'Chromium', version: major }
+					];
+					var platformVersion = chPlatform === 'Windows' ? '15.0.0'
+						: chPlatform === 'macOS' ? '14.3.0' : '10.0.0';
+					var uad = {
+						brands: brands,
+						mobile: mobile,
+						platform: chPlatform,
+						getHighEntropyValues: function() {
+							return Promise.resolve({
+								brands: brands,
+								mobile: mobile,
+								platform: chPlatform,
+								platformVersion: platformVersion,
+								architecture: 'x86',
+								bitness: '64',
+								model: '',
+								uaFullVersion: major + '.0.0.0',
+								fullVersionList: brands,
+								wow64: false
+							});
+						},
+						toJSON: function() { return { brands: brands, mobile: mobile, platform: chPlatform }; }
+					};
+					defineNav('userAgentData', function() { return uad; });
+				} catch (e) {}
+
+				// Screen / device pixel ratio — keep a coherent desktop profile.
+				if (!mobile) {
+					defineConst(screen, 'width', 1920);
+					defineConst(screen, 'height', 1080);
+					defineConst(screen, 'availWidth', 1920);
+					defineConst(screen, 'availHeight', 1040);
+					defineConst(screen, 'colorDepth', 24);
+					defineConst(screen, 'pixelDepth', 24);
+					defineConst(window, 'devicePixelRatio', 1);
+				}
+
+				// WebGL vendor / renderer — Android GPUs (Mali/Adreno/SwiftShader) are an
+				// instant mobile giveaway; rewrite to a desktop ANGLE/Intel identity.
+				try {
+					var VENDOR = 0x1F00, RENDERER = 0x1F01;
+					var UNMASKED_VENDOR = 0x9245, UNMASKED_RENDERER = 0x9246;
+					var webglVendor = 'Google Inc. (Intel)';
+					var webglRenderer =
+						'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+					function patch(proto) {
+						if (!proto || !proto.getParameter) return;
+						var orig = proto.getParameter.bind(proto);
+						proto.getParameter = function(p) {
+							try {
+								if (p === VENDOR) return webglVendor;
+								if (p === RENDERER) return webglRenderer;
+								if (p === UNMASKED_VENDOR) return webglVendor;
+								if (p === UNMASKED_RENDERER) return webglRenderer;
+							} catch (e) {}
+							return orig(p);
+						};
 					}
-					return originalToString.call(this);
+					if (window.WebGLRenderingContext) patch(WebGLRenderingContext.prototype);
+					if (window.WebGL2RenderingContext) patch(WebGL2RenderingContext.prototype);
+				} catch (e) {}
+
+				// Hide our toString patches from detection.
+				var origToString = Function.prototype.toString;
+				Function.prototype.toString = function() {
+					try {
+						if (navigator.permissions && this === navigator.permissions.query) {
+							return 'function query() { [native code] }';
+						}
+						if (navigator.userAgentData && this === navigator.userAgentData.getHighEntropyValues) {
+							return 'function getHighEntropyValues() { [native code] }';
+						}
+					} catch (e) {}
+					return origToString.call(this);
 				};
 
 				return 'stealth_applied';

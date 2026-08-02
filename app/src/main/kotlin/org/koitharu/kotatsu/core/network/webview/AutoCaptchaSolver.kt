@@ -12,6 +12,9 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import androidx.annotation.MainThread
+import androidx.webkit.ScriptHandler
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -60,6 +63,7 @@ class AutoCaptchaSolver @Inject constructor(
 ) {
 
 	private var webViewCached: WeakReference<WebView>? = null
+	private var startScriptHandler: ScriptHandler? = null
 	private val mutex = Mutex()
 
 	@Volatile
@@ -117,8 +121,12 @@ class AutoCaptchaSolver @Inject constructor(
 					val webView = obtainWebView()
 					try {
 						// Must match network stack UA or Cloudflare rejects cf_clearance.
-						webView.settings.userAgentString =
-							exception.source.getUserAgent() ?: ChromeTlsIdentity.USER_AGENT
+						val userAgent = exception.source.getUserAgent() ?: ChromeTlsIdentity.USER_AGENT
+						webView.settings.userAgentString = userAgent
+						// Inject stealth at document-start so it runs before the page's own
+						// scripts read the real (Android) fingerprints — and in every frame,
+						// including Cloudflare's cross-origin Turnstile iframe.
+						installDocumentStartStealth(webView, userAgent)
 						// Seed WebView with existing session cookies before challenge load.
 						syncCookiesToWebView(exception.url)
 						withTimeout(attemptTimeout) {
@@ -126,6 +134,7 @@ class AutoCaptchaSolver @Inject constructor(
 								webView.webViewClient = AutoCaptchaWebViewClient(
 									cookieJar = cookieJar,
 									targetUrl = exception.url,
+									userAgent = userAgent,
 									continuation = cont,
 								)
 								// Forward original request headers (Referer, etc.)
@@ -135,15 +144,17 @@ class AutoCaptchaSolver @Inject constructor(
 								} else {
 									webView.loadUrl(exception.url, extraHeaders)
 								}
-								// Inject stealth script immediately after loadUrl to mask
-								// bot fingerprints before the page's own scripts execute.
-								webView.evaluateJavascript(CaptchaSolverScript.STEALTH_SCRIPT, null)
+								// Belt-and-braces: also inject stealth after load. This runs in
+								// the page realm even if document-start injection is unavailable.
+								webView.evaluateJavascript(CaptchaSolverScript.stealthScript(userAgent), null)
 							}
 						}
 						// Persist and pull clearance back into OkHttp CookieJar.
 						CookieManager.getInstance().flush()
 						syncCookiesFromWebView(exception.url)
 					} finally {
+						startScriptHandler?.remove()
+						startScriptHandler = null
 						webView.reset()
 					}
 				}
@@ -241,18 +252,43 @@ class AutoCaptchaSolver @Inject constructor(
 	@MainThread
 	private fun attachToWindow(webView: WebView) {
 		val activity = topActivity ?: return
-		val root = (activity.window?.decorView as? ViewGroup) ?: return
-		if (root.isAttachedToWindow.not()) return
+		val content = (activity.findViewById<android.view.View>(android.R.id.content) as? ViewGroup)
+			?: (activity.window?.decorView as? ViewGroup)
+			?: return
+		if (content.isAttachedToWindow.not()) return
 		val parent = webView.parent
-		if (parent === root) return
+		if (parent === content) return
 		(parent as? ViewGroup)?.removeView(webView)
 		try {
+			// Place BEHIND the app's own content: fully composited (so the page reports
+			// document.visibilityState = "visible" and rAF fires) but visually covered by
+			// the opaque app UI. alpha=0.01 is a fallback cloak in case the app content is
+			// translucent, while still rendering to Turnstile.
 			webView.alpha = INVISIBLE_ALPHA
 			webView.visibility = android.view.View.VISIBLE
-			root.addView(webView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+			content.addView(webView, 0, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
 		} catch (e: Exception) {
 			e.printStackTraceDebug()
 		}
+	}
+
+	/**
+	 * Inject [CaptchaSolverScript.stealthScript] at document-start so it executes before
+	 * the page's own scripts (and inside cross-origin Turnstile iframes). Falls back to
+	 * the post-load injection in [trySolve] on WebViews that lack the feature.
+	 */
+	@MainThread
+	private fun installDocumentStartStealth(webView: WebView, userAgent: String) {
+		startScriptHandler?.remove()
+		startScriptHandler = null
+		if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
+		runCatching {
+			startScriptHandler = WebViewCompat.addDocumentStartJavaScript(
+				webView,
+				CaptchaSolverScript.stealthScript(userAgent),
+				setOf("*"),
+			)
+		}.onFailure { it.printStackTraceDebug() }
 	}
 
 	private fun MangaSource.getUserAgent(): String? {
