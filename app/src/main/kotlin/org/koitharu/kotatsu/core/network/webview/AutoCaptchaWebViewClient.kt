@@ -167,28 +167,17 @@ internal class AutoCaptchaWebViewClient(
 	 * Sync cookies from Android WebView CookieManager back into OkHttp's CookieJar.
 	 * Without this, [isClearanceObtained] never sees `cf_clearance` set by the WebView.
 	 *
-	 * Constructs cookies with explicit domain/path to ensure they match subsequent
-	 * requests to the same domain (including subdomains).
+	 * Uses [Cookie.parse] so domain/path/hostOnly attributes are preserved correctly
+	 * for subsequent requests to the same host.
 	 */
 	private fun syncCookiesFromWebView() {
 		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
 		val cookieString = cookieManager.getCookie(targetUrl) ?: return
-		val domain = httpUrl.host
 		val cookies = cookieString.split(";").mapNotNull { raw ->
 			val trimmed = raw.trim()
 			if (trimmed.isEmpty()) return@mapNotNull null
-			val eqIndex = trimmed.indexOf('=')
-			if (eqIndex <= 0) return@mapNotNull null
-			val name = trimmed.substring(0, eqIndex).trim()
-			val value = trimmed.substring(eqIndex + 1).trim()
-			Cookie.Builder()
-				.name(name)
-				.value(value)
-				.domain(domain)
-				.path("/")
-				.secure()
-				.build()
+			Cookie.parse(httpUrl, trimmed)
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)

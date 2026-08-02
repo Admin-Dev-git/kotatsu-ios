@@ -1,8 +1,14 @@
 package org.koitharu.kotatsu.core.network.webview
 
+import android.app.Activity
+import android.app.Application
 import android.content.Context
+import android.os.Bundle
+import android.view.ViewGroup
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import androidx.annotation.MainThread
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -41,6 +47,45 @@ class WebViewExecutor @Inject constructor(
 
 	private var webViewCached: WeakReference<WebView>? = null
 	private val mutex = Mutex()
+
+	@Volatile
+	private var topActivity: Activity? = null
+
+	private val activityLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
+		override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+		override fun onActivityStarted(activity: Activity) {
+			if (topActivity == null) {
+				topActivity = activity
+			}
+		}
+
+		override fun onActivityResumed(activity: Activity) {
+			topActivity = activity
+		}
+
+		override fun onActivityPaused(activity: Activity) {
+			if (topActivity === activity) {
+				topActivity = null
+			}
+		}
+
+		override fun onActivityStopped(activity: Activity) {
+			if (topActivity === activity) {
+				topActivity = null
+			}
+		}
+
+		override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+		override fun onActivityDestroyed(activity: Activity) {
+			if (topActivity === activity) {
+				topActivity = null
+			}
+		}
+	}
+
+	init {
+		(context as? Application)?.registerActivityLifecycleCallbacks(activityLifecycleCallbacks)
+	}
 
 	val defaultUserAgent: String by lazy {
 		ChromeTlsIdentity.USER_AGENT
@@ -148,13 +193,41 @@ class WebViewExecutor @Inject constructor(
 			webViewCached?.get()?.let {
 				return@withContext it
 			}
-			WebView(context).also {
-				it.configureForParser(ChromeTlsIdentity.USER_AGENT)
-				webViewCached = WeakReference(it)
+			WebView(context).also { webView ->
+				webView.configureForParser(ChromeTlsIdentity.USER_AGENT)
+				webViewCached = WeakReference(webView)
 				proxyProvider.applyWebViewConfig()
-				it.onResume()
-				it.resumeTimers()
+				// A WebView that is never attached to a window reports
+				// document.visibilityState = "hidden", does not render and never
+				// fires requestAnimationFrame — Cloudflare Turnstile treats that
+				// as an instant bot signal and never issues cf_clearance.
+				// Attach (invisible) to the visible activity window instead.
+				attachToWindow(webView)
+				webView.onResume()
+				webView.resumeTimers()
 			}
+		}
+	}
+
+	/**
+	 * Attach the WebView to the topmost activity's window so it renders and runs
+	 * rAF like a real browser tab. It is kept visually imperceptible via a tiny alpha,
+	 * so the user never sees it.
+	 */
+	@MainThread
+	private fun attachToWindow(webView: WebView) {
+		val activity = topActivity ?: return
+		val root = (activity.window?.decorView as? ViewGroup) ?: return
+		if (root.isAttachedToWindow.not()) return
+		val parent = webView.parent
+		if (parent === root) return
+		(parent as? ViewGroup)?.removeView(webView)
+		try {
+			webView.alpha = INVISIBLE_ALPHA
+			webView.visibility = android.view.View.VISIBLE
+			root.addView(webView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+		} catch (e: Exception) {
+			e.printStackTraceDebug()
 		}
 	}
 
@@ -171,10 +244,14 @@ class WebViewExecutor @Inject constructor(
 		settings.userAgentString = ChromeTlsIdentity.USER_AGENT
 		loadDataWithBaseURL(null, " ", "text/html", null, null)
 		clearHistory()
+		// Detach from the activity window so we don't leak the view.
+		(parent as? ViewGroup)?.removeView(this)
 	}
 
 	companion object {
 		private const val MAX_RESOLVE_ATTEMPTS = 3
 		private const val RETRY_TIMEOUT_INCREMENT = 10_000L // Add 10s per retry
+		/** Nearly invisible but still rendered/attached — Turnstile needs a real window. */
+		private const val INVISIBLE_ALPHA = 0.01f
 	}
 }
