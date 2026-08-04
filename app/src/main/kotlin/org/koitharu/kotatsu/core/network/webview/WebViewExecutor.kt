@@ -84,6 +84,13 @@ class WebViewExecutor @Inject constructor(
 								?: defaultUserAgent
 						// Sync existing cookies to WebView before loading
 						syncCookiesToWebView(exception.url)
+						// Inject stealth BEFORE loading so CloudFlare never sees webdriver=true.
+						// Suspend until it completes so it definitely runs before the challenge JS.
+						suspendCoroutine<Unit> { stealthCont ->
+							webView.evaluateJavascript(
+								CaptchaSolverScript.stealthScript(webView.settings.userAgentString),
+							) { stealthCont.resume(Unit) }
+						}
 						withTimeout(attemptTimeout) {
 							suspendCancellableCoroutine { cont ->
 								webView.webViewClient = CaptchaContinuationClient(
@@ -133,7 +140,7 @@ class WebViewExecutor @Inject constructor(
 	private fun syncCookiesFromWebView(url: String) {
 		val httpUrl = url.toHttpUrlOrNull() ?: return
 		val cookieManager = android.webkit.CookieManager.getInstance()
-		val cookieString = cookieManager.getCookie(url) ?: return
+		val cookieString = runCatching { cookieManager.getCookie(url) }.getOrNull() ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
 			org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}

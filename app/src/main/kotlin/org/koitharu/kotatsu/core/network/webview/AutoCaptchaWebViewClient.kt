@@ -7,7 +7,6 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.CancellableContinuation
-import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
@@ -24,6 +23,9 @@ import kotlin.coroutines.resume
  * 3. Polls for clearance every [COOKIE_CHECK_INTERVAL] ms (Turnstile often sets
  *    the cookie without further navigation events)
  * 4. Resumes the continuation when the challenge is solved
+ *
+ * Note: The stealth script ([CaptchaSolverScript.stealthScript]) must be injected
+ * BEFORE [WebView.loadUrl] — see [AutoCaptchaSolver.trySolve].
  */
 internal class AutoCaptchaWebViewClient(
 	private val cookieJar: MutableCookieJar,
@@ -178,11 +180,13 @@ internal class AutoCaptchaWebViewClient(
 	/**
 	 * Sync cookies from Android WebView CookieManager back into OkHttp's CookieJar.
 	 * Without this, [isClearanceObtained] never sees `cf_clearance` set by the WebView.
+	 *
+	 * Uses [runCatching] around getCookie to guard against crashes on malformed cookie data.
 	 */
 	private fun syncCookiesFromWebView() {
 		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
-		val cookieString = cookieManager.getCookie(targetUrl) ?: return
+		val cookieString = runCatching { cookieManager.getCookie(targetUrl) }.getOrNull() ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
 			org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}

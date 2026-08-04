@@ -6,14 +6,12 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.annotation.MainThread
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.core.exceptions.CloudFlareProtectedException
 import org.koitharu.kotatsu.core.network.CommonHeaders
@@ -32,6 +30,7 @@ import java.lang.ref.WeakReference
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
+import kotlin.coroutines.resume
 
 /**
  * Automatically solves CloudFlare JS challenges (Turnstile, Managed Challenge)
@@ -100,6 +99,14 @@ class AutoCaptchaSolver @Inject constructor(
 										userAgent = userAgent,
 										continuation = cont,
 									)
+									// Inject stealth BEFORE loading so CloudFlare never sees webdriver=true.
+									// evaluateJavascript is async — suspend until the script has run,
+									// guaranteeing it executes before the CF challenge JS runs.
+									suspendCancellableCoroutine<Unit> { stealthCont ->
+										webView.evaluateJavascript(
+											CaptchaSolverScript.stealthScript(userAgent),
+										) { stealthCont.resume(Unit) }
+									}
 									webView.loadUrl(exception.url)
 								}
 							}
@@ -142,7 +149,8 @@ class AutoCaptchaSolver @Inject constructor(
 	private fun syncCookiesFromWebView(url: String) {
 		val httpUrl = url.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
-		val cookieString = cookieManager.getCookie(url) ?: return
+		// getCookie can throw on malformed cookie data — guard to prevent crashes
+		val cookieString = runCatching { cookieManager.getCookie(url) }.getOrNull() ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
 			AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}

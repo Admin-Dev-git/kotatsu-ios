@@ -1,0 +1,112 @@
+name: Android Release CI
+
+on:
+  push:
+    branches:
+      - devel
+      - master
+  pull_request:
+    branches:
+      - devel
+      - master
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Build variant to assemble'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - nightly
+
+concurrency:
+  group: android-release-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Keystore alias/name and passwords for the debug.keystore committed to the repo.
+  # CI only — do not use for production distribution.
+  KEYSTORE_ALIAS: debug
+  KEYSTORE_PASSWORD: android
+  # kotatsu-parsers repo to publish from (change to clawzex/kotatsu-parsers for your fork)
+  PARSERS_REPO: Admin-Dev-git/kotatsu-parsers
+  GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx2g -Dorg.gradle.daemon=false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v4
+        with:
+          path: kotatsu-ios
+
+      - name: Checkout parsers
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PARSERS_REPO }}
+          path: kotatsu-parsers
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;35.0.0"
+          yes | sdkmanager --licenses || true
+
+      - name: Configure local.properties
+        working-directory: kotatsu-ios
+        run: echo "sdk.dir=${ANDROID_SDK_ROOT}" >> local.properties
+
+      - name: Create keystore for release signing
+        # The debug.keystore is committed to the repo. Its base64 representation is stored
+        # as a GitHub Actions secret named KOTATSU_KEYSTORE_B64 (Settings → Secrets → Actions).
+        # Generate with: cat app/debug.keystore | base64 | tr -d '\n'
+        env:
+          KOTATSU_KEYSTORE_B64: ${{ secrets.KOTATSU_KEYSTORE_B64 }}
+        run: |
+          if [[ -z "${KOTATSU_KEYSTORE_B64}" ]]; then
+            echo "::error::KOTATSU_KEYSTORE_B64 secret is not set. Add it in GitHub repo Settings → Secrets and Actions."
+            exit 1
+          fi
+          echo "${KOTATSU_KEYSTORE_B64}" | base64 -d > kotatsu-ios/app/debug.keystore
+
+      - name: Publish parsers to Maven Local
+        working-directory: kotatsu-parsers
+        run: ./gradlew publishToMavenLocal -x test --no-daemon --stacktrace
+
+      - name: Build${{ github.event.inputs.variant || 'release' }} APK
+        working-directory: kotatsu-ios
+        run: |
+          ./gradlew \
+            assemble${{ github.event.inputs.variant || 'release' }} \
+            --no-daemon \
+            --stacktrace \
+            -Psigning.debug.file=app/debug.keystore \
+            -Psigning.debug.keyAlias=${{ env.KEYSTORE_ALIAS }} \
+            -Psigning.debug.storePassword=${{ env.KEYSTORE_PASSWORD }} \
+            -Psigning.debug.keyPassword=${{ env.KEYSTORE_PASSWORD }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ github.event.inputs.variant || 'release' }}-apk
+          path: |
+            kotatsu-ios/app/build/outputs/apk/${{ github.event.inputs.variant || 'release' }}/**/*.apk
+          if-no-files-found: error
+          retention-days: 14

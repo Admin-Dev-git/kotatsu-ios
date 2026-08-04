@@ -39,6 +39,30 @@ android {
 		}
 		resValue 'string', 'tg_backup_bot_token', localProperties.getProperty('tg_backup_bot_token', '')
 	}
+	signingConfigs {
+		debug {
+			// In local development: place app/debug.keystore and optionally set these in gradle.properties.
+			// In CI: values are overridden by -P arguments passed from the GitHub Actions workflow.
+			// Default values here match the CI keystore (app/debug.keystore, alias=debug, password=android).
+			def keystoreFile = project.hasProperty('signing.debug.file')
+				? project.property('signing.debug.file')
+				: 'app/debug.keystore'
+			def keyAlias = project.hasProperty('signing.debug.keyAlias')
+				? project.property('signing.debug.keyAlias')
+				: 'debug'
+			def storePassword = project.hasProperty('signing.debug.storePassword')
+				? project.property('signing.debug.storePassword')
+				: 'android'
+			def keyPassword = project.hasProperty('signing.debug.keyPassword')
+				? project.property('signing.debug.keyPassword')
+				: 'android'
+			storeFile file(keystoreFile)
+			storePassword storePassword
+			keyAlias keyAlias
+			keyPassword keyPassword
+		}
+	}
+
 	buildTypes {
 		debug {
 			applicationIdSuffix = '.debug'
