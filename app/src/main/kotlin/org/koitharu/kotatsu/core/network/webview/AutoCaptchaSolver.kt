@@ -12,6 +12,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.core.exceptions.CloudFlareProtectedException
 import org.koitharu.kotatsu.core.network.CommonHeaders
@@ -22,6 +23,7 @@ import org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity
 import org.koitharu.kotatsu.core.parser.MangaRepository
 import org.koitharu.kotatsu.core.parser.ParserMangaRepository
 import org.koitharu.kotatsu.core.util.ext.configureForParser
+import org.koitharu.kotatsu.core.util.ext.layoutOffscreen
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
 import org.koitharu.kotatsu.parsers.model.MangaSource
 import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
@@ -30,7 +32,6 @@ import java.lang.ref.WeakReference
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
-import kotlin.coroutines.resume
 
 /**
  * Automatically solves CloudFlare JS challenges (Turnstile, Managed Challenge)
@@ -58,13 +59,14 @@ class AutoCaptchaSolver @Inject constructor(
 	 */
 	suspend fun trySolve(exception: CloudFlareProtectedException, timeout: Long): Boolean {
 		val httpUrl = exception.url.toHttpUrlOrNull()
+		val clearanceBefore = CloudFlareHelper.getClearanceCookie(cookieJar, exception.url)
 
 		// If another thread is actively solving, wait for a new clearance cookie to appear
 		if (mutex.isLocked) {
 			val startTime = System.currentTimeMillis()
 			while (System.currentTimeMillis() - startTime < timeout) {
 				kotlinx.coroutines.delay(400)
-				if (!CloudFlareHelper.getClearanceCookie(cookieJar, exception.url).isNullOrEmpty()) {
+				if (hasNewClearance(exception.url, clearanceBefore)) {
 					return true
 				}
 				if (!mutex.isLocked) break
@@ -72,16 +74,20 @@ class AutoCaptchaSolver @Inject constructor(
 		}
 
 		return mutex.withLock {
-			// Clear any expired clearance cookie before solving so we only accept a newly acquired cookie
-			if (httpUrl != null) {
-				cookieJar.removeCookies(httpUrl) { cookie ->
-					cookie.name == "cf_clearance"
-				}
+			// Someone else may have solved the challenge while we were queued on the lock.
+			if (hasNewClearance(exception.url, clearanceBefore)) {
+				return@withLock true
 			}
 
 			for (attempt in 1..MAX_SOLVE_ATTEMPTS) {
+				// Only drop the existing clearance cookie before a *retry*. Purging it upfront
+				// turns any unrelated 403 into a forced re-solve, which is what made the captcha
+				// come back over and over.
+				if (attempt > 1 && httpUrl != null) {
+					purgeClearance(httpUrl, exception.url)
+				}
 				val attemptTimeout = timeout + (attempt - 1) * RETRY_TIMEOUT_INCREMENT
-				val result = runCatchingCancellable {
+				runCatchingCancellable {
 					withContext(Dispatchers.Main.immediate) {
 						val webView = obtainWebView()
 						try {
@@ -99,20 +105,27 @@ class AutoCaptchaSolver @Inject constructor(
 										userAgent = userAgent,
 										continuation = cont,
 									)
-									// Inject stealth BEFORE loading so CloudFlare never sees webdriver=true.
-									// evaluateJavascript is async — suspend until the script has run,
-									// guaranteeing it executes before the CF challenge JS runs.
-									suspendCancellableCoroutine<Unit> { stealthCont ->
-										webView.evaluateJavascript(
-											CaptchaSolverScript.stealthScript(userAgent),
-										) { stealthCont.resume(Unit) }
+									if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
+										runCatching {
+											androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
+												webView,
+												CaptchaSolverScript.stealthScript(userAgent),
+												setOf("*"),
+											)
+										}
 									}
-									webView.loadUrl(exception.url)
+									webView.evaluateJavascript(
+										CaptchaSolverScript.stealthScript(userAgent),
+									) {
+										webView.loadUrl(exception.url)
+									}
 								}
 							}
+						} finally {
+							// Harvest cookies even when the attempt timed out or was cancelled:
+							// Turnstile may have set cf_clearance moments before the deadline.
 							AndroidCookieJar.safeFlush(CookieManager.getInstance())
 							syncCookiesFromWebView(exception.url)
-						} finally {
 							webView.reset()
 						}
 					}
@@ -122,10 +135,29 @@ class AutoCaptchaSolver @Inject constructor(
 						exception.addSuppressed(e)
 					}
 				}
-				if (result.isSuccess) return@withLock true
+				// The WebView continuation resumes for several reasons that do not mean the
+				// challenge passed (page navigated, detector said "no challenge here", …), so a
+				// fresh cf_clearance cookie is the only thing accepted as proof of a solve.
+				if (hasNewClearance(exception.url, clearanceBefore)) return@withLock true
 			}
 			false
 		}
+	}
+
+	private fun hasNewClearance(url: String, previous: String?): Boolean {
+		val current = CloudFlareHelper.getClearanceCookie(cookieJar, url)
+		return !current.isNullOrBlank() && current != previous
+	}
+
+	/**
+	 * Expire `cf_clearance` in both stores so the next attempt starts from a clean slate.
+	 * Deliberately narrow: other `cf_*`/session cookies are left alone.
+	 */
+	private fun purgeClearance(httpUrl: HttpUrl, url: String) {
+		val cookieManager = CookieManager.getInstance()
+		cookieManager.setCookie(url, "cf_clearance=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/")
+		AndroidCookieJar.safeFlush(cookieManager)
+		cookieJar.removeCookies(httpUrl) { it.name == CF_CLEARANCE }
 	}
 
 	/**
@@ -169,6 +201,7 @@ class AutoCaptchaSolver @Inject constructor(
 			}
 			WebView(context).also {
 				it.configureForParser(webViewExecutor.defaultUserAgent)
+				it.layoutOffscreen()
 				webViewCached = WeakReference(it)
 				proxyProvider.applyWebViewConfig()
 				it.onResume()
@@ -195,5 +228,6 @@ class AutoCaptchaSolver @Inject constructor(
 	companion object {
 		private const val MAX_SOLVE_ATTEMPTS = 2
 		private const val RETRY_TIMEOUT_INCREMENT = 5_000L
+		private const val CF_CLEARANCE = "cf_clearance"
 	}
 }

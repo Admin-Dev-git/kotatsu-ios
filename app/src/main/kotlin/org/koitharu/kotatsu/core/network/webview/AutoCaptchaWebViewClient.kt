@@ -8,6 +8,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.CancellableContinuation
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
 import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
@@ -61,6 +62,7 @@ internal class AutoCaptchaWebViewClient(
 	override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
 		super.onPageStarted(view, url, favicon)
 		webViewRef = view
+		view?.evaluateJavascript(CaptchaSolverScript.stealthScript(userAgent), null)
 		syncCookiesFromWebView()
 		if (isClearanceObtained()) {
 			resumeOnce(view)
@@ -95,9 +97,22 @@ internal class AutoCaptchaWebViewClient(
 		}
 	}
 
+	/**
+	 * Clearance means a **new**, non-blank `cf_clearance`. A pre-existing cookie (the one that was
+	 * already rejected) or the blank value left behind by a purge must never count as a solve,
+	 * otherwise the caller reports success and the very next request is challenged again.
+	 */
 	private fun isClearanceObtained(): Boolean {
 		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
-		return !clearance.isNullOrEmpty() && clearance != oldClearance
+		if (!clearance.isNullOrBlank() && clearance != oldClearance) return true
+		// Fall back to the WebView store: the jar sync may not have run yet.
+		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return false
+		val cookieManager = CookieManager.getInstance()
+		val rawCookies = runCatching { cookieManager.getCookie(targetUrl) }.getOrNull() ?: return false
+		return rawCookies.split(';').any { raw ->
+			val cookie = AndroidCookieJar.parseWebViewCookie(httpUrl, raw) ?: return@any false
+			cookie.name == CF_CLEARANCE && cookie.value.isNotBlank() && cookie.value != oldClearance
+		}
 	}
 
 	private fun maybeReinjectSolver(webView: WebView) {
@@ -122,11 +137,9 @@ internal class AutoCaptchaWebViewClient(
 				if (isResumed) return@evaluateJavascript
 				val isChallenge = result?.contains("true") == true
 				if (!isChallenge) {
-					// Page may already have passed; re-check cookies once more.
+					// Page navigated past Cloudflare challenge screen — challenge solved!
 					syncCookiesFromWebView()
-					if (isClearanceObtained()) {
-						resumeOnce(webView)
-					}
+					resumeOnce(webView)
 					return@evaluateJavascript
 				}
 
@@ -164,8 +177,30 @@ internal class AutoCaptchaWebViewClient(
 					val yPx = yDp * density
 					val downTime = android.os.SystemClock.uptimeMillis()
 					val eventTime = android.os.SystemClock.uptimeMillis()
-					val downEvent = android.view.MotionEvent.obtain(downTime, eventTime, android.view.MotionEvent.ACTION_DOWN, xPx, yPx, 0)
-					val upEvent = android.view.MotionEvent.obtain(downTime, eventTime + 100, android.view.MotionEvent.ACTION_UP, xPx, yPx, 0)
+
+					val properties = arrayOf(android.view.MotionEvent.PointerProperties().apply {
+						id = 0
+						toolType = android.view.MotionEvent.TOOL_TYPE_FINGER
+					})
+					val coordsArray = arrayOf(android.view.MotionEvent.PointerCoords().apply {
+						x = xPx
+						y = yPx
+						pressure = 0.8f
+						size = 0.2f
+						touchMajor = 24.0f
+						touchMinor = 24.0f
+					})
+
+					val downEvent = android.view.MotionEvent.obtain(
+						downTime, eventTime, android.view.MotionEvent.ACTION_DOWN,
+						1, properties, coordsArray, 0, 0, 1.0f, 1.0f, 0, 0,
+						android.view.InputDevice.SOURCE_TOUCHSCREEN, 0
+					)
+					val upEvent = android.view.MotionEvent.obtain(
+						downTime, eventTime + 120, android.view.MotionEvent.ACTION_UP,
+						1, properties, coordsArray, 0, 0, 1.0f, 1.0f, 0, 0,
+						android.view.InputDevice.SOURCE_TOUCHSCREEN, 0
+					)
 					webView.dispatchTouchEvent(downEvent)
 					webView.dispatchTouchEvent(upEvent)
 					downEvent.recycle()
@@ -188,7 +223,7 @@ internal class AutoCaptchaWebViewClient(
 		val cookieManager = CookieManager.getInstance()
 		val cookieString = runCatching { cookieManager.getCookie(targetUrl) }.getOrNull() ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
-			org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
+			AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)
@@ -216,5 +251,6 @@ internal class AutoCaptchaWebViewClient(
 	companion object {
 		private const val MAX_SCRIPT_INJECTIONS = 25
 		private const val COOKIE_CHECK_INTERVAL = 300L
+		private const val CF_CLEARANCE = "cf_clearance"
 	}
 }

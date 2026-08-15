@@ -78,7 +78,8 @@ class CaptchaContinuationClient(
 
 	private fun isClearanceObtained(): Boolean {
 		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
-		return clearance != null && clearance != oldClearance
+		// A blank value is what a purged/expired cookie looks like — it is not clearance.
+		return !clearance.isNullOrBlank() && clearance != oldClearance
 	}
 
 	/**

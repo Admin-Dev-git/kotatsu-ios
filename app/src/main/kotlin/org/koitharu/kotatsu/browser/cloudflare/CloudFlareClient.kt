@@ -23,6 +23,7 @@ class CloudFlareClient(
 ) : BrowserClient(callback, adBlock) {
 
 	private val handler = Handler(Looper.getMainLooper())
+	private val oldClearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
 	private var webViewRef: WebView? = null
 	private var checkPassedFired = false
 
@@ -59,7 +60,19 @@ class CloudFlareClient(
 		callback.onPageLoaded()
 		syncCookiesFromWebView(webView)
 		if (checkClearance(webView)) return
-		tryAutoSolve(webView)
+		// No *new* clearance yet. If the page is not a challenge at all, the existing cookie is
+		// evidently being accepted, so treat that as done instead of leaving the user staring at a
+		// loaded page forever.
+		webView.evaluateJavascript(CaptchaSolverScript.DETECT_CHALLENGE_SCRIPT) { result ->
+			if (checkPassedFired) return@evaluateJavascript
+			if (result?.contains("true") != true &&
+				!CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl).isNullOrBlank()
+			) {
+				firePassed()
+			} else {
+				tryAutoSolve(webView)
+			}
+		}
 	}
 
 	override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
@@ -76,14 +89,21 @@ class CloudFlareClient(
 	private fun checkClearance(view: WebView?): Boolean {
 		if (checkPassedFired) return true
 		syncCookiesFromWebView(view)
+		// Only a fresh, non-blank cookie proves the challenge was passed. Accepting the cookie that
+		// was already rejected is what let the app declare success and get challenged again.
 		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
-		if (!clearance.isNullOrEmpty()) {
-			checkPassedFired = true
-			handler.removeCallbacks(cookieCheckRunnable)
-			callback.onCheckPassed()
+		if (!clearance.isNullOrBlank() && clearance != oldClearance) {
+			firePassed()
 			return true
 		}
 		return false
+	}
+
+	private fun firePassed() {
+		if (checkPassedFired) return
+		checkPassedFired = true
+		handler.removeCallbacks(cookieCheckRunnable)
+		callback.onCheckPassed()
 	}
 
 	private fun injectStealthScript(view: WebView?) {

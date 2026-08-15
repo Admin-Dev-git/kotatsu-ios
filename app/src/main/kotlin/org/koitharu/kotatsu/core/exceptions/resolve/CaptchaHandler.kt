@@ -75,6 +75,7 @@ class CaptchaHandler @Inject constructor(
 ) : EventListener() {
 
 	private val exceptionMap = MutableScatterMap<MangaSource, CloudFlareProtectedException>()
+	private val autoSolveFailures = MutableScatterMap<MangaSource, Long>()
 	private val mutex = Mutex()
 
 	@CheckResult
@@ -111,22 +112,31 @@ class CaptchaHandler @Inject constructor(
 		if (source == UnknownMangaSource) {
 			return@withContext false
 		}
-		if (exception is CloudFlareProtectedException && settings.isAutoCaptchaEnabled) {
-			if (autoCaptchaSolver.trySolve(exception, AUTO_SOLVE_TIMEOUT)) {
+		if (exception != null && !isAutoSolveOnCooldown(source)) {
+			// Exactly one headless attempt per cooldown window. Chaining the script-injecting
+			// solver with the bare `tryResolveCaptcha` pass only added minutes of delay and more
+			// requests to an endpoint Cloudflare is already challenging — which is what escalated
+			// a solvable challenge into a hard block and made the captcha come back forever.
+			val solved = if (exception is CloudFlareProtectedException && settings.isAutoCaptchaEnabled) {
+				autoCaptchaSolver.trySolve(exception, AUTO_SOLVE_TIMEOUT)
+			} else {
+				webViewExecutor.tryResolveCaptcha(exception, RESOLVE_TIMEOUT)
+			}
+			if (solved) {
 				onCaptchaSolved(source)
 				return@withContext true
 			}
-		}
-		if (exception != null && webViewExecutor.tryResolveCaptcha(exception, RESOLVE_TIMEOUT)) {
-			onCaptchaSolved(source)
-			return@withContext true
+			markAutoSolveFailed(source)
 		}
 		mutex.withLock {
 			var removedException: CloudFlareProtectedException? = null
 			if (exception is CloudFlareProtectedException) {
 				exceptionMap[source] = exception
 			} else {
+				// No exception means the challenge was resolved (or dismissed) elsewhere — e.g. the
+				// user solved it in CloudFlareActivity — so the headless cooldown no longer applies.
 				removedException = exceptionMap.remove(source)
+				autoSolveFailures.remove(source)
 			}
 			val dao = databaseProvider.get().getSourcesDao()
 			dao.setCfState(source.name, exception?.state ?: CloudFlareHelper.PROTECTION_NOT_DETECTED)
@@ -148,9 +158,31 @@ class CaptchaHandler @Inject constructor(
 		false
 	}
 
+	/**
+	 * True while a headless solve attempt for [source] failed less than [AUTO_SOLVE_COOLDOWN] ago.
+	 * Without this, every retried request re-runs the whole solve pipeline, so a challenge that
+	 * genuinely needs a human turns into an endless silent retry loop. Returning `false` from
+	 * [handleException] instead leaves the notification up, which opens `CloudFlareActivity`.
+	 */
+	private suspend fun isAutoSolveOnCooldown(source: MangaSource): Boolean = mutex.withLock {
+		val lastFailure = autoSolveFailures[source] ?: return@withLock false
+		val elapsed = System.currentTimeMillis() - lastFailure
+		if (elapsed in 0..AUTO_SOLVE_COOLDOWN) {
+			true
+		} else {
+			autoSolveFailures.remove(source)
+			false
+		}
+	}
+
+	private suspend fun markAutoSolveFailed(source: MangaSource) = mutex.withLock {
+		autoSolveFailures[source] = System.currentTimeMillis()
+	}
+
 	private suspend fun onCaptchaSolved(source: MangaSource) {
 		mutex.withLock {
 			val removed = exceptionMap.remove(source)
+			autoSolveFailures.remove(source)
 			val dao = databaseProvider.get().getSourcesDao()
 			dao.setCfState(source.name, CloudFlareHelper.PROTECTION_NOT_DETECTED)
 			if (context.checkNotificationPermission(CHANNEL_ID)) {
@@ -313,5 +345,6 @@ class CaptchaHandler @Inject constructor(
 		private const val ACTION_DISCARD = "org.koitharu.kotatsu.CAPTCHA_DISCARD"
 		private const val RESOLVE_TIMEOUT = 45_000L
 		private const val AUTO_SOLVE_TIMEOUT = 35_000L
+		private const val AUTO_SOLVE_COOLDOWN = 60_000L
 	}
 }

@@ -47,15 +47,10 @@ internal object CaptchaSolverScript {
 					} catch (e) {}
 				};
 
-				def(navProto, 'webdriver', undefined);
+				def(navProto, 'webdriver', false);
 				def(navProto, 'languages', ['en-US', 'en']);
 				def(navProto, 'language', 'en-US');
-				def(navProto, 'languages', ['en-US', 'en', 'es']);
-				def(navProto, 'hardwareConcurrency', 8);
-				def(navProto, 'deviceMemory', 8);
-				def(navProto, 'platform', 'Win32');
-				def(navProto, 'maxTouchPoints', 0);
-				def(navProto, 'pdfViewerEnabled', true);
+				def(navProto, 'pdfViewerEnabled', false);
 				def(navProto, 'cookieEnabled', true);
 
 				// ── Permissions API (notifications → denied, keeps CF happy) ────────
@@ -84,15 +79,10 @@ internal object CaptchaSolverScript {
 					});
 				} catch (e) {}
 
-				// ── Screen / window dimensions (realistic) ───────────────────────────
-				try {
-					def(window.screen, 'width', 1920);
-					def(window.screen, 'height', 1080);
-					def(window.screen, 'availWidth', 1920);
-					def(window.screen, 'availHeight', 1040);
-					def(window.screen, 'colorDepth', 24);
-					def(window.screen, 'pixelDepth', 24);
-				} catch (e) {}
+				// ── Screen / window dimensions ───────────────────────────────────────
+				// Intentionally NOT spoofed: the real WebView metrics must stay consistent
+				// with the Android User-Agent and client hints we send, otherwise
+				// Cloudflare rejects the cf_clearance it just issued.
 
 				// ── Turnstile render hook ────────────────────────────────────────────
 				// This intercepts the callback CF uses to signal a successful solve,
@@ -147,15 +137,46 @@ internal object CaptchaSolverScript {
 	 */
 	val SOLVE_SCRIPT: String = """
 		(function() {
+		try {
 			function dispatchClick(el) {
 				if (!el) return false;
 				try {
-					var opts = { bubbles: true, cancelable: true, view: window };
-					el.dispatchEvent(new PointerEvent('pointerdown', opts));
-					el.dispatchEvent(new MouseEvent('mousedown', opts));
-					el.dispatchEvent(new PointerEvent('pointerup', opts));
-					el.dispatchEvent(new MouseEvent('mouseup', opts));
-					el.dispatchEvent(new MouseEvent('click', opts));
+					var rect = el.getBoundingClientRect();
+					var cx = rect.left + rect.width / 2;
+					var cy = rect.top + rect.height / 2;
+					var pointerOpts = {
+						bubbles: true, cancelable: true, view: window,
+						clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+						pointerId: 1, width: 20, height: 20, pressure: 0.5,
+						pointerType: 'touch', isPrimary: true
+					};
+					el.dispatchEvent(new PointerEvent('pointerdown', pointerOpts));
+					el.dispatchEvent(new MouseEvent('mousedown', pointerOpts));
+
+					if (typeof Touch !== 'undefined' && typeof TouchEvent !== 'undefined') {
+						try {
+							var touch = new Touch({
+								identifier: Date.now(), target: el,
+								clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+								pageX: cx, pageY: cy, radiusX: 11.5, radiusY: 11.5,
+								rotationAngle: 0, force: 0.5
+							});
+							var touchStart = new TouchEvent('touchstart', {
+								cancelable: true, bubbles: true,
+								touches: [touch], targetTouches: [touch], changedTouches: [touch]
+							});
+							var touchEnd = new TouchEvent('touchend', {
+								cancelable: true, bubbles: true,
+								touches: [], targetTouches: [], changedTouches: [touch]
+							});
+							el.dispatchEvent(touchStart);
+							el.dispatchEvent(touchEnd);
+						} catch (e) {}
+					}
+
+					el.dispatchEvent(new PointerEvent('pointerup', pointerOpts));
+					el.dispatchEvent(new MouseEvent('mouseup', pointerOpts));
+					el.dispatchEvent(new MouseEvent('click', pointerOpts));
 					if (typeof el.click === 'function') el.click();
 					return true;
 				} catch (e) {
@@ -319,6 +340,7 @@ internal object CaptchaSolverScript {
 		} catch (e) {
 			return 'error: ' + (e && e.message ? e.message : String(e));
 		}
+		})();
 	""".trimIndent()
 
 	/**

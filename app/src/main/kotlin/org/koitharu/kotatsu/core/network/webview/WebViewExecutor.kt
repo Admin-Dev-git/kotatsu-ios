@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.core.network.webview
 
 import android.content.Context
+import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.annotation.MainThread
@@ -11,19 +12,21 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.core.exceptions.CloudFlareException
 import org.koitharu.kotatsu.core.exceptions.CloudFlareProtectedException
 import org.koitharu.kotatsu.core.network.CommonHeaders
+import org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.core.network.proxy.ProxyProvider
 import org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity
 import org.koitharu.kotatsu.core.parser.MangaRepository
 import org.koitharu.kotatsu.core.parser.ParserMangaRepository
 import org.koitharu.kotatsu.core.util.ext.configureForParser
+import org.koitharu.kotatsu.core.util.ext.layoutOffscreen
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
 import org.koitharu.kotatsu.parsers.model.MangaSource
+import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
 import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
 import java.lang.ref.WeakReference
 import javax.inject.Inject
@@ -69,10 +72,11 @@ class WebViewExecutor @Inject constructor(
 	}
 
 	suspend fun tryResolveCaptcha(exception: CloudFlareException, timeout: Long): Boolean = mutex.withLock {
+		val clearanceBefore = CloudFlareHelper.getClearanceCookie(cookieJar, exception.url)
 		// Retry up to MAX_RESOLVE_ATTEMPTS times with increasing timeout
 		for (attempt in 1..MAX_RESOLVE_ATTEMPTS) {
 			val attemptTimeout = timeout + (attempt - 1) * RETRY_TIMEOUT_INCREMENT
-			val result = runCatchingCancellable {
+			runCatchingCancellable {
 				withContext(Dispatchers.Main.immediate) {
 					val webView = obtainWebView()
 					try {
@@ -82,15 +86,7 @@ class WebViewExecutor @Inject constructor(
 							protectedHeaders?.get(CommonHeaders.USER_AGENT)?.takeIf { it.isNotBlank() }
 								?: exception.source.getUserAgent()
 								?: defaultUserAgent
-						// Sync existing cookies to WebView before loading
 						syncCookiesToWebView(exception.url)
-						// Inject stealth BEFORE loading so CloudFlare never sees webdriver=true.
-						// Suspend until it completes so it definitely runs before the challenge JS.
-						suspendCoroutine<Unit> { stealthCont ->
-							webView.evaluateJavascript(
-								CaptchaSolverScript.stealthScript(webView.settings.userAgentString),
-							) { stealthCont.resume(Unit) }
-						}
 						withTimeout(attemptTimeout) {
 							suspendCancellableCoroutine { cont ->
 								webView.webViewClient = CaptchaContinuationClient(
@@ -98,13 +94,18 @@ class WebViewExecutor @Inject constructor(
 									targetUrl = exception.url,
 									continuation = cont,
 								)
-								webView.loadUrl(exception.url)
+								webView.evaluateJavascript(
+									CaptchaSolverScript.stealthScript(webView.settings.userAgentString),
+								) {
+									webView.loadUrl(exception.url)
+								}
 							}
 						}
-						// Flush and sync cookies back
-						org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar.safeFlush(android.webkit.CookieManager.getInstance())
-						syncCookiesFromWebView(exception.url)
 					} finally {
+						// Harvest cookies even on timeout/cancellation — the challenge may have
+						// completed moments before the deadline.
+						AndroidCookieJar.safeFlush(CookieManager.getInstance())
+						syncCookiesFromWebView(exception.url)
 						webView.reset()
 					}
 				}
@@ -114,7 +115,10 @@ class WebViewExecutor @Inject constructor(
 					exception.addSuppressed(e)
 				}
 			}
-			if (result.isSuccess) return@withLock true
+			// Completing the WebView block is not proof of anything: only a fresh, non-blank
+			// cf_clearance means the challenge was actually passed.
+			val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, exception.url)
+			if (!clearance.isNullOrBlank() && clearance != clearanceBefore) return@withLock true
 		}
 		false
 	}
@@ -126,11 +130,11 @@ class WebViewExecutor @Inject constructor(
 	private fun syncCookiesToWebView(url: String) {
 		val httpUrl = url.toHttpUrlOrNull() ?: return
 		val cookies = cookieJar.loadForRequest(httpUrl)
-		val cookieManager = android.webkit.CookieManager.getInstance()
+		val cookieManager = CookieManager.getInstance()
 		for (cookie in cookies) {
 			cookieManager.setCookie(url, cookie.toString())
 		}
-		org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar.safeFlush(cookieManager)
+		AndroidCookieJar.safeFlush(cookieManager)
 	}
 
 	/**
@@ -139,10 +143,10 @@ class WebViewExecutor @Inject constructor(
 	 */
 	private fun syncCookiesFromWebView(url: String) {
 		val httpUrl = url.toHttpUrlOrNull() ?: return
-		val cookieManager = android.webkit.CookieManager.getInstance()
+		val cookieManager = CookieManager.getInstance()
 		val cookieString = runCatching { cookieManager.getCookie(url) }.getOrNull() ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
-			org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
+			AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)
@@ -159,6 +163,7 @@ class WebViewExecutor @Inject constructor(
 			}
 			WebView(context).also {
 				it.configureForParser(defaultUserAgent)
+				it.layoutOffscreen()
 				webViewCached = WeakReference(it)
 				proxyProvider.applyWebViewConfig()
 				it.onResume()

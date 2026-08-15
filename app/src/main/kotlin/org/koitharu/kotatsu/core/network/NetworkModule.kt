@@ -71,6 +71,7 @@ interface NetworkModule {
 			settings: AppSettings,
 			proxyProvider: ProxyProvider,
 			autoCaptchaSolverProvider: Provider<AutoCaptchaSolver>,
+			commonHeadersInterceptor: CommonHeadersInterceptor,
 		): OkHttpClient = OkHttpClient.Builder().apply {
 			dispatcher(Dispatcher().apply {
 				maxRequestsPerHost = 4
@@ -90,6 +91,7 @@ interface NetworkModule {
 				installExtraCertificates(contextProvider.get())
 			}
 			cache(cache)
+			addInterceptor(commonHeadersInterceptor)
 			addInterceptor(BrowserHeadersInterceptor())
 			addInterceptor(GZipInterceptor())
 			addInterceptor(RetryInterceptor())
@@ -105,10 +107,8 @@ interface NetworkModule {
 		@MangaHttpClient
 		fun provideMangaHttpClient(
 			@BaseHttpClient baseClient: OkHttpClient,
-			commonHeadersInterceptor: CommonHeadersInterceptor,
 		): OkHttpClient = baseClient.newBuilder().apply {
 			addNetworkInterceptor(CacheLimitInterceptor())
-			addInterceptor(commonHeadersInterceptor)
 		}.build()
 
 	}

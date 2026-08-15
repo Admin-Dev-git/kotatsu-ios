@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.koitharu.kotatsu.core.cache.MemoryContentCache
+import org.koitharu.kotatsu.core.exceptions.CloudFlareException
 import org.koitharu.kotatsu.core.exceptions.CloudFlareProtectedException
 import org.koitharu.kotatsu.core.exceptions.InteractiveActionRequiredException
 import org.koitharu.kotatsu.core.exceptions.ProxyConfigException
@@ -130,8 +131,10 @@ class ParserMangaRepository(
 			}
 		},
 		onFailure = {
-			when (it.cause) {
+			val e = it.cause ?: it
+			when (e) {
 				is CloudFlareProtectedException,
+				is CloudFlareException,
 				is AuthRequiredException,
 				is InteractiveActionRequiredException,
 				is ProxyConfigException -> true

@@ -21,8 +21,8 @@ android {
 		applicationId 'org.koitharu.kotatsu'
 		minSdk = 23
 		targetSdk = 36
-		versionCode = 1060
-		versionName = '9.4.28-fix'
+		versionCode = 1067
+		versionName = '9.4.35-fix'
 		generatedDensities = []
 		testInstrumentationRunner 'org.koitharu.kotatsu.HiltTestRunner'
 		ksp {
@@ -44,22 +44,24 @@ android {
 			// In local development: place app/debug.keystore and optionally set these in gradle.properties.
 			// In CI: values are overridden by -P arguments passed from the GitHub Actions workflow.
 			// Default values here match the CI keystore (app/debug.keystore, alias=debug, password=android).
-			def keystoreFile = project.hasProperty('signing.debug.file')
+			def ksFile = project.hasProperty('signing.debug.file')
 				? project.property('signing.debug.file')
-				: 'app/debug.keystore'
-			def keyAlias = project.hasProperty('signing.debug.keyAlias')
+				: 'debug.keystore'
+			def ksAlias = project.hasProperty('signing.debug.keyAlias')
 				? project.property('signing.debug.keyAlias')
 				: 'debug'
-			def storePassword = project.hasProperty('signing.debug.storePassword')
+			def ksStorePassword = project.hasProperty('signing.debug.storePassword')
 				? project.property('signing.debug.storePassword')
 				: 'android'
-			def keyPassword = project.hasProperty('signing.debug.keyPassword')
+			def ksKeyPassword = project.hasProperty('signing.debug.keyPassword')
 				? project.property('signing.debug.keyPassword')
 				: 'android'
-			storeFile file(keystoreFile)
-			storePassword storePassword
-			keyAlias keyAlias
-			keyPassword keyPassword
+			if (file(ksFile).exists()) {
+				storeFile file(ksFile)
+				storePassword ksStorePassword
+				keyAlias ksAlias
+				keyPassword ksKeyPassword
+			}
 		}
 	}
 
@@ -117,7 +119,7 @@ android {
 		]
 	}
 	room {
-		schemaDirectory "$projectDir/schemas"
+		schemaDirectory("$projectDir/schemas")
 	}
 	lint {
 		abortOnError true

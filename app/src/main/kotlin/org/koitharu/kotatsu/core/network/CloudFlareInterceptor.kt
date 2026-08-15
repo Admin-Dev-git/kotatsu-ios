@@ -38,19 +38,19 @@ class CloudFlareInterceptor(
 				}
 				val source = request.tag(MangaSource::class.java)
 
-				// Fast path: if another thread solved the captcha, retry immediately
-				if (!CloudFlareHelper.getClearanceCookie(cookieJar, request.url.toString()).isNullOrEmpty()) {
-					val retryResponse = chain.proceed(request)
-					if (CloudFlareHelper.checkResponseForProtection(retryResponse) == CloudFlareHelper.PROTECTION_NOT_DETECTED) {
-						return retryResponse
-					}
-					try {
-						retryResponse.close()
-					} catch (_: Exception) {
-					}
+				// Exactly one retry, and only when we actually hold clearance — another thread may
+				// have solved the challenge while this request was in flight. Firing extra requests
+				// at a challenged endpoint is what escalates Cloudflare from "challenge" to
+				// "blocked", so an unconditional second attempt is worse than throwing.
+				val hasClearance =
+					!CloudFlareHelper.getClearanceCookie(cookieJar, request.url.toString()).isNullOrEmpty()
+				if (!hasClearance) {
+					throw CloudFlareProtectedException(
+						url = request.url.toString(),
+						source = source,
+						headers = request.headers,
+					)
 				}
-
-				// Retry once before throwing (standard OkHttp retry behavior)
 				val retryResponse = chain.proceed(request)
 				when (CloudFlareHelper.checkResponseForProtection(retryResponse)) {
 					CloudFlareHelper.PROTECTION_NOT_DETECTED -> retryResponse

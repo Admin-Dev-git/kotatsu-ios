@@ -23,6 +23,7 @@ import android.net.ConnectivityManager
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.View
 import android.view.ViewPropertyAnimator
 import android.webkit.CookieManager
 import android.webkit.WebSettings
@@ -30,6 +31,7 @@ import android.webkit.WebView
 import androidx.activity.result.ActivityResultLauncher
 import androidx.annotation.CheckResult
 import androidx.annotation.IntegerRes
+import androidx.annotation.MainThread
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.appcompat.app.AppCompatDialog
@@ -228,6 +230,29 @@ fun WebView.configureForParser(userAgentOverride: String?) = with(settings) {
 	cookieManager.setAcceptCookie(true)
 	cookieManager.setAcceptThirdPartyCookies(this@configureForParser, true)
 }
+
+/**
+ * Measure and lay out a [WebView] that is never attached to a window.
+ *
+ * Without this, every `getBoundingClientRect()` inside the page reports 0x0, so coordinate probing
+ * and synthesised touch events land at (0,0) and Cloudflare Turnstile refuses to complete for a
+ * widget it considers invisible.
+ */
+@MainThread
+fun WebView.layoutOffscreen() {
+	val metrics = resources.displayMetrics
+	val width = metrics.widthPixels.coerceIn(MIN_OFFSCREEN_SIZE, MAX_OFFSCREEN_WIDTH)
+	val height = metrics.heightPixels.coerceIn(MIN_OFFSCREEN_SIZE, MAX_OFFSCREEN_HEIGHT)
+	measure(
+		View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+		View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY),
+	)
+	layout(0, 0, width, height)
+}
+
+private const val MIN_OFFSCREEN_SIZE = 320
+private const val MAX_OFFSCREEN_WIDTH = 1080
+private const val MAX_OFFSCREEN_HEIGHT = 1920
 
 fun Context.restartApplication() {
 	val activity = findActivity()
