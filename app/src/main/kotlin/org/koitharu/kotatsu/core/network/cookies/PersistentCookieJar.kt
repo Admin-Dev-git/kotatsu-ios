@@ -10,8 +10,8 @@ import okhttp3.HttpUrl
  * and mirrors cookies to encrypted preferences so sessions survive restarts reliably.
  */
 class PersistentCookieJar(
-	private val primary: AndroidCookieJar,
-	private val backup: PreferencesCookieJar,
+	private val primary: MutableCookieJar,
+	private val backup: MutableCookieJar,
 ) : MutableCookieJar {
 
 	@WorkerThread
@@ -19,29 +19,34 @@ class PersistentCookieJar(
 		val fromPrimary = primary.loadForRequest(url)
 		val fromBackup = backup.loadForRequest(url)
 		if (fromBackup.isEmpty()) {
-			return fromPrimary
+			return fromPrimary.distinctByName()
 		}
 		if (fromPrimary.isEmpty()) {
-			primary.saveFromResponse(url, fromBackup)
-			return fromBackup
+			val restored = fromBackup.distinctByName()
+			primary.saveFromResponse(url, restored)
+			return restored
 		}
-		val merged = LinkedHashMap<String, Cookie>(fromBackup.size + fromPrimary.size)
+		// One cookie per name, and the live store wins. Merging by name + domain + path instead let a
+		// stale `cf_clearance` travel alongside the fresh one in a single Cookie header: Cloudflare
+		// reads the first value, rejects it and issues another challenge — which is what made the
+		// captcha come back no matter how many times it was solved.
+		val merged = LinkedHashMap<String, Cookie>(fromPrimary.size + fromBackup.size)
+		for (cookie in fromPrimary.distinctByName()) {
+			merged[cookie.name] = cookie
+		}
+		val missingInPrimary = ArrayList<Cookie>()
 		for (cookie in fromBackup) {
-			val key = "${cookie.domain.removePrefix(".")}|${cookie.path}|${cookie.name}"
-			merged[key] = cookie
-		}
-		for (cookie in fromPrimary) {
-			val key = "${cookie.domain.removePrefix(".")}|${cookie.path}|${cookie.name}"
-			merged[key] = cookie
-		}
-		val result = merged.values.toList()
-		val missingInPrimary = result.filter { cookie ->
-			fromPrimary.none { it.name == cookie.name && it.value == cookie.value }
+			// Only names the live store does not know about are restored from the backup. Writing back
+			// a name it already holds would overwrite a fresh value with a superseded one.
+			if (!merged.containsKey(cookie.name)) {
+				merged[cookie.name] = cookie
+				missingInPrimary += cookie
+			}
 		}
 		if (missingInPrimary.isNotEmpty()) {
 			primary.saveFromResponse(url, missingInPrimary)
 		}
-		return result
+		return merged.values.toList()
 	}
 
 	@WorkerThread
@@ -62,5 +67,23 @@ class PersistentCookieJar(
 	override suspend fun clear(): Boolean {
 		backup.clear()
 		return primary.clear()
+	}
+
+	/**
+	 * Keeps one cookie per name, preferring a non-blank value. A single store should never hand out
+	 * two values for one name, but a store polluted by an earlier version of the app still can, and a
+	 * duplicated name on the wire invalidates the cookie for Cloudflare. An emptied cookie is the
+	 * residue of a purge, so it must never win over a real value.
+	 */
+	private fun List<Cookie>.distinctByName(): List<Cookie> {
+		if (size < 2) return this
+		val byName = LinkedHashMap<String, Cookie>(size)
+		for (cookie in this) {
+			val existing = byName[cookie.name]
+			if (existing == null || (existing.value.isBlank() && cookie.value.isNotBlank())) {
+				byName[cookie.name] = cookie
+			}
+		}
+		return byName.values.toList()
 	}
 }

@@ -17,14 +17,15 @@ class BrowserHeadersInterceptor : Interceptor {
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
 		val builder = request.newBuilder()
-		val isImage = request.isImageRequest()
+		val kind = request.classify()
 		if (request.header(CommonHeaders.ACCEPT) == null) {
 			builder.header(
 				CommonHeaders.ACCEPT,
-				if (isImage) {
-					"image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
-				} else {
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+				when (kind) {
+					RequestKind.IMAGE -> "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+					RequestKind.API -> "application/json, text/plain, */*"
+					RequestKind.DOCUMENT ->
+						"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
 				},
 			)
 		}
@@ -38,17 +39,33 @@ class BrowserHeadersInterceptor : Interceptor {
 			builder.header("sec-ch-ua-platform", "\"Android\"")
 		}
 		// Fetch metadata must describe the actual request. Claiming every subresource is a
-		// same-origin top-level navigation is itself a bot signal.
+		// same-origin top-level navigation is itself a bot signal, and `sec-fetch-user: ?1` on
+		// something Chrome would never label a user-activated navigation is one of the cheapest
+		// inconsistencies for Cloudflare to score against us.
 		if (request.header("sec-fetch-dest") == null) {
-			builder.header("sec-fetch-dest", if (isImage) "image" else "document")
+			builder.header(
+				"sec-fetch-dest",
+				when (kind) {
+					RequestKind.IMAGE -> "image"
+					RequestKind.API -> "empty"
+					RequestKind.DOCUMENT -> "document"
+				},
+			)
 		}
 		if (request.header("sec-fetch-mode") == null) {
-			builder.header("sec-fetch-mode", if (isImage) "no-cors" else "navigate")
+			builder.header(
+				"sec-fetch-mode",
+				when (kind) {
+					RequestKind.IMAGE -> "no-cors"
+					RequestKind.API -> "cors"
+					RequestKind.DOCUMENT -> "navigate"
+				},
+			)
 		}
 		if (request.header("sec-fetch-site") == null) {
 			builder.header("sec-fetch-site", request.fetchSite())
 		}
-		if (!isImage && request.header("sec-fetch-user") == null) {
+		if (kind == RequestKind.DOCUMENT && request.header("sec-fetch-user") == null) {
 			builder.header("sec-fetch-user", "?1")
 		}
 		// Do NOT set Accept-Encoding here — OkHttp adds it and transparently decompresses
@@ -65,15 +82,28 @@ class BrowserHeadersInterceptor : Interceptor {
 		}
 	}
 
-	private fun Request.isImageRequest(): Boolean {
+	private fun Request.classify(): RequestKind {
 		val accept = header(CommonHeaders.ACCEPT)
 		if (accept != null) {
-			return accept.startsWith("image/")
+			return when {
+				accept.startsWith("image/") -> RequestKind.IMAGE
+				accept.contains("application/json") || accept.contains("text/plain") -> RequestKind.API
+				else -> RequestKind.DOCUMENT
+			}
 		}
-		val path = url.encodedPath.substringAfterLast('/')
-		val extension = path.substringAfterLast('.', "").lowercase()
-		return extension in IMAGE_EXTENSIONS
+		if (method != "GET" && method != "HEAD") {
+			// A POST from a parser is an XHR/form call, never a top-level navigation.
+			return RequestKind.API
+		}
+		val fileName = url.encodedPath.substringAfterLast('/')
+		return when (fileName.substringAfterLast('.', "").lowercase()) {
+			in IMAGE_EXTENSIONS -> RequestKind.IMAGE
+			"json" -> RequestKind.API
+			else -> RequestKind.DOCUMENT
+		}
 	}
+
+	private enum class RequestKind { DOCUMENT, IMAGE, API }
 
 	private companion object {
 		private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "avif", "gif", "bmp", "jxl")

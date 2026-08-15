@@ -56,7 +56,29 @@ class PreferencesCookieJar(
 		}
 		loadPersistent()
 		val wrapped = cookies.map { CookieWrapper(it) }
+		// A cookie is keyed by name + domain + path + scheme, so the *same* logical cookie can be
+		// stored twice when it arrives once from the network (`Path=/; Secure`) and once from the
+		// WebView (attributes hidden). Both copies then match the request and both are sent, which is
+		// fatal for `cf_clearance`: Cloudflare reads the stale one and re-challenges. Superseding
+		// every other entry with the same name and domain keeps exactly one, and heals stores that
+		// were already polluted by earlier versions.
+		val superseded = HashSet<String>()
+		for (cookie in wrapped) {
+			val key = cookie.key()
+			for ((existingKey, existing) in cache) {
+				if (existingKey != key &&
+					existing.cookie.name == cookie.cookie.name &&
+					existing.cookie.domain == cookie.cookie.domain
+				) {
+					superseded += existingKey
+				}
+			}
+		}
 		prefs.edit(commit = true) {
+			for (key in superseded) {
+				cache.remove(key)
+				remove(key)
+			}
 			for (cookie in wrapped) {
 				val key = cookie.key()
 				cache[key] = cookie

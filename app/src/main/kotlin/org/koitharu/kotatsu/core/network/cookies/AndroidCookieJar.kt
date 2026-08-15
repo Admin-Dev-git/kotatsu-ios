@@ -75,17 +75,39 @@ class AndroidCookieJar : MutableCookieJar {
 			}
 		}
 
+		/**
+		 * Convert one entry of [CookieManager.getCookie]'s `name=value; name=value` output into an
+		 * OkHttp [Cookie].
+		 *
+		 * The WebView deliberately hides every cookie attribute, so the missing ones have to be
+		 * synthesised — and they have to be synthesised to the *same* values the server originally
+		 * sent, otherwise the same cookie ends up stored twice under two different identities
+		 * (a cookie is keyed by name + domain + path). Two `cf_clearance` entries then go out in one
+		 * `Cookie` header, Cloudflare reads the stale one and challenges again, forever.
+		 *
+		 * - `path`: `/`, not OkHttp's default-path. Without it a cookie harvested while solving a
+		 *   challenge at `/manga/x/1` is scoped to `/manga/x`, so it is not even sent to `/`.
+		 * - `secure`: mirrors the URL scheme, so an https cookie keeps the flag the server set.
+		 */
 		fun parseWebViewCookie(url: HttpUrl, rawCookie: String): Cookie? {
 			val trimmed = rawCookie.trim()
 			if (trimmed.isEmpty()) return null
+			// Only the part after the first ';' can hold attributes; a value that happens to contain
+			// "path=" must not be mistaken for one.
+			val attrs = trimmed.substringAfter(';', "")
 			val topDomain = runCatching { url.topPrivateDomain() }.getOrNull()
 				?: extractRootDomain(url.host)
-			val cookieWithDomain = if (trimmed.contains("domain=", ignoreCase = true)) {
-				trimmed
-			} else {
-				"$trimmed; domain=.$topDomain"
+			val builder = StringBuilder(trimmed)
+			if (!attrs.contains("domain=", ignoreCase = true)) {
+				builder.append("; domain=.").append(topDomain)
 			}
-			return Cookie.parse(url, cookieWithDomain)
+			if (!attrs.contains("path=", ignoreCase = true)) {
+				builder.append("; path=/")
+			}
+			if (url.isHttps && !attrs.contains("secure", ignoreCase = true)) {
+				builder.append("; secure")
+			}
+			return Cookie.parse(url, builder.toString())
 				?: Cookie.parse(url, trimmed)
 		}
 

@@ -1,11 +1,13 @@
 package org.koitharu.kotatsu.core.network
 
 import okhttp3.CookieJar
+import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
 import okio.IOException
 import org.koitharu.kotatsu.core.exceptions.CloudFlareBlockedException
 import org.koitharu.kotatsu.core.exceptions.CloudFlareProtectedException
+import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.parsers.model.MangaSource
 import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
 
@@ -42,9 +44,8 @@ class CloudFlareInterceptor(
 				// have solved the challenge while this request was in flight. Firing extra requests
 				// at a challenged endpoint is what escalates Cloudflare from "challenge" to
 				// "blocked", so an unconditional second attempt is worse than throwing.
-				val hasClearance =
-					!CloudFlareHelper.getClearanceCookie(cookieJar, request.url.toString()).isNullOrEmpty()
-				if (!hasClearance) {
+				val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, request.url.toString())
+				if (clearance.isNullOrEmpty()) {
 					throw CloudFlareProtectedException(
 						url = request.url.toString(),
 						source = source,
@@ -61,17 +62,32 @@ class CloudFlareInterceptor(
 						),
 					)
 
-					else -> retryResponse.closeThrowing(
-						CloudFlareProtectedException(
-							url = request.url.toString(),
-							source = source,
-							headers = request.headers,
-						),
-					)
+					else -> {
+						// Challenged twice while holding this clearance: the cookie is dead, whatever
+						// the app thinks. Leaving it in place makes every later solve compare against
+						// a value Cloudflare has already rejected, so "solved" and "still challenged"
+						// stay true at the same time and the prompt returns forever. Scoped to the
+						// exact value observed, so a solve that landed in the meantime is untouched.
+						dropClearance(request.url, clearance)
+						retryResponse.closeThrowing(
+							CloudFlareProtectedException(
+								url = request.url.toString(),
+								source = source,
+								headers = request.headers,
+							),
+						)
+					}
 				}
 			}
 
 			else -> response
+		}
+	}
+
+	private fun dropClearance(url: HttpUrl, value: String) {
+		val jar = cookieJar as? MutableCookieJar ?: return
+		runCatching {
+			jar.removeCookies(url) { cookie -> cookie.name == CF_CLEARANCE && cookie.value == value }
 		}
 	}
 
@@ -82,5 +98,9 @@ class CloudFlareInterceptor(
 			error.addSuppressed(e)
 		}
 		throw error
+	}
+
+	private companion object {
+		private const val CF_CLEARANCE = "cf_clearance"
 	}
 }

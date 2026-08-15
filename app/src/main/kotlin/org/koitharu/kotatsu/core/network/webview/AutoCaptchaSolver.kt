@@ -84,7 +84,7 @@ class AutoCaptchaSolver @Inject constructor(
 				// turns any unrelated 403 into a forced re-solve, which is what made the captcha
 				// come back over and over.
 				if (attempt > 1 && httpUrl != null) {
-					purgeClearance(httpUrl, exception.url)
+					purgeClearance(httpUrl)
 				}
 				val attemptTimeout = timeout + (attempt - 1) * RETRY_TIMEOUT_INCREMENT
 				runCatchingCancellable {
@@ -152,12 +152,14 @@ class AutoCaptchaSolver @Inject constructor(
 	/**
 	 * Expire `cf_clearance` in both stores so the next attempt starts from a clean slate.
 	 * Deliberately narrow: other `cf_*`/session cookies are left alone.
+	 *
+	 * Goes through the cookie jar rather than writing a blank cookie by hand — a hand-written
+	 * `cf_clearance=` is host-only, so it does not replace the domain-scoped cookie Cloudflare set;
+	 * it only adds an empty second copy of the same name, which is then sent on the wire and rejected.
 	 */
-	private fun purgeClearance(httpUrl: HttpUrl, url: String) {
-		val cookieManager = CookieManager.getInstance()
-		cookieManager.setCookie(url, "cf_clearance=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/")
-		AndroidCookieJar.safeFlush(cookieManager)
+	private fun purgeClearance(httpUrl: HttpUrl) {
 		cookieJar.removeCookies(httpUrl) { it.name == CF_CLEARANCE }
+		AndroidCookieJar.safeFlush(CookieManager.getInstance())
 	}
 
 	/**
