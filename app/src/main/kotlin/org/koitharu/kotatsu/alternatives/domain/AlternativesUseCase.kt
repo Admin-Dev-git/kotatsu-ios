@@ -59,7 +59,7 @@ class AlternativesUseCase @Inject constructor(
 	private suspend fun getSources(ref: MangaSource, disabled: Boolean): List<MangaSource> = if (disabled) {
 		sourcesRepository.getDisabledSources()
 	} else {
-		sourcesRepository.getEnabledSources()
+		(sourcesRepository.getEnabledSources() + sourcesRepository.getDisabledSources()).distinct()
 	}.sortedByDescending { it.priority(ref) }
 
 	private fun MangaSource.priority(ref: MangaSource): Int {

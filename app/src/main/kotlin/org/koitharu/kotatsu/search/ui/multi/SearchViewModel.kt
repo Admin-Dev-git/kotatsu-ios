@@ -165,13 +165,14 @@ class SearchViewModel @Inject constructor(
 		val prevJob = searchJob
 		searchJob = launchLoadingJob(Dispatchers.Default) {
 			prevJob?.cancelAndJoin()
+			includeDisabledSources.value = true
 			appendResult(searchHistory())
 			appendResult(searchFavorites())
 			appendResult(searchLocal())
 			val sources = if (pinnedOnly.value) {
 				sourcesRepository.getPinnedSources().toList()
 			} else {
-				sourcesRepository.getEnabledSources()
+				(sourcesRepository.getEnabledSources() + sourcesRepository.getDisabledSources()).distinct()
 			}
 			val semaphore = Semaphore(MAX_PARALLELISM)
 			sources.map { source ->

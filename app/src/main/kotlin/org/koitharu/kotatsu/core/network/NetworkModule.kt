@@ -22,7 +22,6 @@ import org.koitharu.kotatsu.core.network.proxy.ProxyProvider
 import org.koitharu.kotatsu.core.prefs.AppSettings
 import org.koitharu.kotatsu.core.util.ext.assertNotInMainThread
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
-import org.koitharu.kotatsu.core.network.webview.AutoCaptchaSolver
 import org.koitharu.kotatsu.local.data.LocalStorageManager
 import java.util.concurrent.TimeUnit
 import javax.inject.Provider
@@ -70,9 +69,8 @@ interface NetworkModule {
 			cookieJar: CookieJar,
 			settings: AppSettings,
 			proxyProvider: ProxyProvider,
-			autoCaptchaSolverProvider: Provider<AutoCaptchaSolver>,
-			commonHeadersInterceptor: CommonHeadersInterceptor,
 		): OkHttpClient = OkHttpClient.Builder().apply {
+			assertNotInMainThread()
 			dispatcher(Dispatcher().apply {
 				maxRequestsPerHost = 4
 				maxRequests = 12
@@ -91,7 +89,6 @@ interface NetworkModule {
 				installExtraCertificates(contextProvider.get())
 			}
 			cache(cache)
-			addInterceptor(commonHeadersInterceptor)
 			addInterceptor(BrowserHeadersInterceptor())
 			addInterceptor(GZipInterceptor())
 			addInterceptor(RetryInterceptor())
@@ -107,8 +104,10 @@ interface NetworkModule {
 		@MangaHttpClient
 		fun provideMangaHttpClient(
 			@BaseHttpClient baseClient: OkHttpClient,
+			commonHeadersInterceptor: CommonHeadersInterceptor,
 		): OkHttpClient = baseClient.newBuilder().apply {
 			addNetworkInterceptor(CacheLimitInterceptor())
+			addInterceptor(commonHeadersInterceptor)
 		}.build()
 
 	}

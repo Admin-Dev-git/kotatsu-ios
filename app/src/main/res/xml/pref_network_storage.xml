@@ -55,6 +55,12 @@
         app:useSimpleSummaryProvider="true" />
 
     <SwitchPreferenceCompat
+        android:defaultValue="true"
+        android:key="auto_captcha"
+        android:summary="@string/auto_captcha_summary"
+        android:title="@string/auto_captcha" />
+
+    <SwitchPreferenceCompat
         android:key="ssl_bypass"
         android:summary="@string/ignore_ssl_errors_summary"
         android:title="@string/ignore_ssl_errors" />

@@ -46,7 +46,7 @@
 	</queries>
 
 	<application
-		android:name="org.koitharu.kotatsu.core.BaseApp"
+		android:name="org.koitharu.kotatsu.KotatsuApp"
 		android:allowBackup="true"
 		android:backupAgent="org.koitharu.kotatsu.backups.domain.AppBackupAgent"
 		android:dataExtractionRules="@xml/backup_rules"

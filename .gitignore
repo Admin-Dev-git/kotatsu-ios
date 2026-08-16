@@ -22,9 +22,10 @@
 /.idea/inspectionProfiles/
 .DS_Store
 /build
+/.kotlin
 /captures
 .externalNativeBuild
 .cxx
-/.idea/deviceManager.xml
-/.kotlin/
 /.idea/AndroidProjectSystem.xml
+
+

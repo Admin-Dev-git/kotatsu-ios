@@ -26,7 +26,6 @@ import android.provider.Settings
 import android.view.View
 import android.view.ViewPropertyAnimator
 import android.webkit.CookieManager
-import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.activity.result.ActivityResultLauncher
 import androidx.annotation.CheckResult
@@ -213,15 +212,11 @@ fun Context.ensureRamAtLeast(requiredSize: Long) {
 fun WebView.configureForParser(userAgentOverride: String?) = with(settings) {
 	javaScriptEnabled = true
 	domStorageEnabled = true
-	databaseEnabled = true
-	javaScriptCanOpenWindowsAutomatically = true
-	useWideViewPort = true
-	loadWithOverviewMode = true
 	mediaPlaybackRequiresUserGesture = false
-	mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
 	if (WebViewFeature.isFeatureSupported(WebViewFeature.MUTE_AUDIO)) {
 		WebViewCompat.setAudioMuted(this@configureForParser, true)
 	}
+	databaseEnabled = true
 	allowContentAccess = false
 	if (userAgentOverride != null) {
 		userAgentString = userAgentOverride
@@ -232,27 +227,37 @@ fun WebView.configureForParser(userAgentOverride: String?) = with(settings) {
 }
 
 /**
- * Measure and lay out a [WebView] that is never attached to a window.
+ * Give a WebView that is not part of any layout a real size.
  *
- * Without this, every `getBoundingClientRect()` inside the page reports 0x0, so coordinate probing
- * and synthesised touch events land at (0,0) and Cloudflare Turnstile refuses to complete for a
- * widget it considers invisible.
+ * An unmeasured WebView is 0×0, so every `getBoundingClientRect()` inside it is empty: Cloudflare's
+ * Turnstile widget counts as invisible and refuses to complete, coordinate extraction returns
+ * nothing, and synthesised touches all land on (0, 0). Attaching to a window is still preferable
+ * (it also fixes `visibilityState` and `requestAnimationFrame`); this is the fallback for when there
+ * is no activity window to attach to, and it is harmless when there is.
  */
+@MainThread
+fun WebView.layoutOffscreen(widthPx: Int, heightPx: Int) {
+	if (widthPx <= 0 || heightPx <= 0) return
+	if (isAttachedToWindow && width > 0 && height > 0) return
+	measure(
+		View.MeasureSpec.makeMeasureSpec(widthPx, View.MeasureSpec.EXACTLY),
+		View.MeasureSpec.makeMeasureSpec(heightPx, View.MeasureSpec.EXACTLY),
+	)
+	layout(0, 0, widthPx, heightPx)
+}
+
+/** Sizes the WebView to the device display, which is what a real browser tab would report. */
 @MainThread
 fun WebView.layoutOffscreen() {
 	val metrics = resources.displayMetrics
-	val width = metrics.widthPixels.coerceIn(MIN_OFFSCREEN_SIZE, MAX_OFFSCREEN_WIDTH)
-	val height = metrics.heightPixels.coerceIn(MIN_OFFSCREEN_SIZE, MAX_OFFSCREEN_HEIGHT)
-	measure(
-		View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-		View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY),
+	layoutOffscreen(
+		widthPx = metrics.widthPixels.coerceIn(MIN_OFFSCREEN_SIZE_PX, MAX_OFFSCREEN_SIZE_PX),
+		heightPx = metrics.heightPixels.coerceIn(MIN_OFFSCREEN_SIZE_PX, MAX_OFFSCREEN_SIZE_PX),
 	)
-	layout(0, 0, width, height)
 }
 
-private const val MIN_OFFSCREEN_SIZE = 320
-private const val MAX_OFFSCREEN_WIDTH = 1080
-private const val MAX_OFFSCREEN_HEIGHT = 1920
+private const val MIN_OFFSCREEN_SIZE_PX = 320
+private const val MAX_OFFSCREEN_SIZE_PX = 2560
 
 fun Context.restartApplication() {
 	val activity = findActivity()

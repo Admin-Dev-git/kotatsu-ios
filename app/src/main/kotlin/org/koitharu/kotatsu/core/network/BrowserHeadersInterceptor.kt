@@ -4,6 +4,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
+import org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity
 
 /**
  * Adds browser-like headers so Cloudflare-protected sources treat requests as a normal client.
@@ -30,13 +31,13 @@ class BrowserHeadersInterceptor : Interceptor {
 			)
 		}
 		if (request.header("sec-ch-ua") == null) {
-			builder.header("sec-ch-ua", "\"Not(A:Brand\";v=\"99\", \"Google Chrome\";v=\"133\", \"Chromium\";v=\"133\"")
+			builder.header("sec-ch-ua", ChromeTlsIdentity.SEC_CH_UA)
 		}
 		if (request.header("sec-ch-ua-mobile") == null) {
-			builder.header("sec-ch-ua-mobile", "?1")
+			builder.header("sec-ch-ua-mobile", ChromeTlsIdentity.SEC_CH_UA_MOBILE)
 		}
 		if (request.header("sec-ch-ua-platform") == null) {
-			builder.header("sec-ch-ua-platform", "\"Android\"")
+			builder.header("sec-ch-ua-platform", ChromeTlsIdentity.SEC_CH_UA_PLATFORM)
 		}
 		// Fetch metadata must describe the actual request. Claiming every subresource is a
 		// same-origin top-level navigation is itself a bot signal, and `sec-fetch-user: ?1` on

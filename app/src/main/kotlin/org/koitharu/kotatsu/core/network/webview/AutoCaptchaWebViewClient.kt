@@ -19,19 +19,17 @@ import kotlin.coroutines.resume
  * A [WebViewClient] that automatically solves CloudFlare JS challenges.
  *
  * On each page load it:
- * 1. Syncs WebView cookies into OkHttp and checks if `cf_clearance` changed
- * 2. If not solved, injects [CaptchaSolverScript] (detect + continuous solve loop)
- * 3. Polls for clearance every [COOKIE_CHECK_INTERVAL] ms (Turnstile often sets
+ * 1. Injects stealth anti-detection script on page start (before page scripts run)
+ * 2. Syncs WebView cookies into OkHttp and checks if `cf_clearance` changed
+ * 3. If not solved, injects [CaptchaSolverScript] (detect + continuous solve loop)
+ * 4. Polls for clearance every [COOKIE_CHECK_INTERVAL] ms (Turnstile often sets
  *    the cookie without further navigation events)
- * 4. Resumes the continuation when the challenge is solved
- *
- * Note: The stealth script ([CaptchaSolverScript.stealthScript]) must be injected
- * BEFORE [WebView.loadUrl] — see [AutoCaptchaSolver.trySolve].
+ * 5. Resumes the continuation when the challenge is solved
  */
 internal class AutoCaptchaWebViewClient(
 	private val cookieJar: MutableCookieJar,
 	private val targetUrl: String,
-	private val userAgent: String = "",
+	private val userAgent: String,
 	private val continuation: Continuation<Unit>,
 ) : WebViewClient() {
 
@@ -62,7 +60,9 @@ internal class AutoCaptchaWebViewClient(
 	override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
 		super.onPageStarted(view, url, favicon)
 		webViewRef = view
-		view?.evaluateJavascript(CaptchaSolverScript.stealthScript(userAgent), null)
+		// Inject stealth script on every page start to ensure it's active
+		// before any page scripts execute (CloudFlare checks fingerprints early).
+		view?.let { injectStealthScript(it) }
 		syncCookiesFromWebView()
 		if (isClearanceObtained()) {
 			resumeOnce(view)
@@ -98,27 +98,43 @@ internal class AutoCaptchaWebViewClient(
 	}
 
 	/**
-	 * Clearance means a **new**, non-blank `cf_clearance`. A pre-existing cookie (the one that was
-	 * already rejected) or the blank value left behind by a purge must never count as a solve,
-	 * otherwise the caller reports success and the very next request is challenged again.
+	 * A solve is proven by one thing only: a `cf_clearance` that is present, non-empty, and different
+	 * from the value held before the attempt. Anything weaker reports success while the request that
+	 * follows is challenged again, which is exactly the loop this class kept producing — a substring
+	 * test for `cf_clearance=` also matches the emptied cookie a failed purge leaves behind.
 	 */
 	private fun isClearanceObtained(): Boolean {
 		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
-		if (!clearance.isNullOrBlank() && clearance != oldClearance) return true
-		// Fall back to the WebView store: the jar sync may not have run yet.
+		if (isFresh(clearance)) return true
+		// The jar can lag behind the WebView by one sync, so consult the live store too.
 		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return false
-		val cookieManager = CookieManager.getInstance()
-		val rawCookies = runCatching { cookieManager.getCookie(targetUrl) }.getOrNull() ?: return false
-		return rawCookies.split(';').any { raw ->
-			val cookie = AndroidCookieJar.parseWebViewCookie(httpUrl, raw) ?: return@any false
-			cookie.name == CF_CLEARANCE && cookie.value.isNotBlank() && cookie.value != oldClearance
+		val raw = CookieManager.getInstance().getCookie(targetUrl) ?: return false
+		return raw.split(';').any { part ->
+			val cookie = AndroidCookieJar.parseWebViewCookie(httpUrl, part)
+			cookie?.name == CF_CLEARANCE && isFresh(cookie?.value)
+		}
+	}
+
+	private fun isFresh(clearance: String?): Boolean =
+		!clearance.isNullOrBlank() && clearance != oldClearance
+
+	/**
+	 * Inject the stealth anti-detection script. This masks bot fingerprints
+	 * (navigator.webdriver, missing window.chrome, empty plugins, etc.)
+	 * that CloudFlare Turnstile checks before presenting the challenge.
+	 */
+	private fun injectStealthScript(webView: WebView) {
+		try {
+			webView.evaluateJavascript(CaptchaSolverScript.stealthScript(userAgent), null)
+		} catch (e: Exception) {
+			e.printStackTraceDebug()
 		}
 	}
 
 	private fun maybeReinjectSolver(webView: WebView) {
 		if (isResumed) return
 		if (scriptInjectCount >= MAX_SCRIPT_INJECTIONS) return
-		// Light re-inject of one-shot click strategies without restarting the loop.
+		// Light re-inject of one-shot click strategies and native hardware touch.
 		scriptInjectCount++
 		try {
 			dispatchHardwareTouch(webView)
@@ -137,9 +153,15 @@ internal class AutoCaptchaWebViewClient(
 				if (isResumed) return@evaluateJavascript
 				val isChallenge = result?.contains("true") == true
 				if (!isChallenge) {
-					// Page navigated past Cloudflare challenge screen — challenge solved!
+					// The challenge screen is gone, which is necessary but not sufficient: an error
+					// page, an interstitial that redirected nowhere, or a plain rate-limit page all
+					// look like "no challenge" too. Resuming here without a cookie is what reported
+					// success while the retried request was challenged again — the loop. Keep polling
+					// and let the timeout decide instead.
 					syncCookiesFromWebView()
-					resumeOnce(webView)
+					if (isClearanceObtained()) {
+						resumeOnce(webView)
+					}
 					return@evaluateJavascript
 				}
 
@@ -165,63 +187,22 @@ internal class AutoCaptchaWebViewClient(
 	}
 
 	private fun dispatchHardwareTouch(webView: WebView) {
-		try {
-			webView.evaluateJavascript(CaptchaSolverScript.GET_WIDGET_COORDINATES_SCRIPT) { res ->
-				if (isResumed) return@evaluateJavascript
-				val coords = res?.trim('"')?.replace("\\", "")?.split(',')
-				if (coords != null && coords.size == 2) {
-					val xDp = coords[0].toFloatOrNull() ?: return@evaluateJavascript
-					val yDp = coords[1].toFloatOrNull() ?: return@evaluateJavascript
-					val density = webView.resources.displayMetrics.density
-					val xPx = xDp * density
-					val yPx = yDp * density
-					val downTime = android.os.SystemClock.uptimeMillis()
-					val eventTime = android.os.SystemClock.uptimeMillis()
-
-					val properties = arrayOf(android.view.MotionEvent.PointerProperties().apply {
-						id = 0
-						toolType = android.view.MotionEvent.TOOL_TYPE_FINGER
-					})
-					val coordsArray = arrayOf(android.view.MotionEvent.PointerCoords().apply {
-						x = xPx
-						y = yPx
-						pressure = 0.8f
-						size = 0.2f
-						touchMajor = 24.0f
-						touchMinor = 24.0f
-					})
-
-					val downEvent = android.view.MotionEvent.obtain(
-						downTime, eventTime, android.view.MotionEvent.ACTION_DOWN,
-						1, properties, coordsArray, 0, 0, 1.0f, 1.0f, 0, 0,
-						android.view.InputDevice.SOURCE_TOUCHSCREEN, 0
-					)
-					val upEvent = android.view.MotionEvent.obtain(
-						downTime, eventTime + 120, android.view.MotionEvent.ACTION_UP,
-						1, properties, coordsArray, 0, 0, 1.0f, 1.0f, 0, 0,
-						android.view.InputDevice.SOURCE_TOUCHSCREEN, 0
-					)
-					webView.dispatchTouchEvent(downEvent)
-					webView.dispatchTouchEvent(upEvent)
-					downEvent.recycle()
-					upEvent.recycle()
-				}
-			}
-		} catch (e: Exception) {
-			e.printStackTraceDebug()
-		}
+		webView.tapChallengeWidget(isObsolete = { isResumed })
 	}
 
 	/**
 	 * Sync cookies from Android WebView CookieManager back into OkHttp's CookieJar.
 	 * Without this, [isClearanceObtained] never sees `cf_clearance` set by the WebView.
 	 *
-	 * Uses [runCatching] around getCookie to guard against crashes on malformed cookie data.
+	 * Goes through [AndroidCookieJar.parseWebViewCookie]: `CookieManager.getCookie` hides every
+	 * attribute, and a bare [Cookie.parse] then applies OkHttp's default-path rule, storing the
+	 * clearance under a *second* identity scoped to the challenge URL's directory. Both copies are
+	 * then sent together, Cloudflare reads the stale one and challenges again — endlessly.
 	 */
 	private fun syncCookiesFromWebView() {
 		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
-		val cookieString = runCatching { cookieManager.getCookie(targetUrl) }.getOrNull() ?: return
+		val cookieString = cookieManager.getCookie(targetUrl) ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
 			AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}
@@ -249,8 +230,8 @@ internal class AutoCaptchaWebViewClient(
 	}
 
 	companion object {
-		private const val MAX_SCRIPT_INJECTIONS = 25
-		private const val COOKIE_CHECK_INTERVAL = 300L
+		private const val MAX_SCRIPT_INJECTIONS = 20
+		private const val COOKIE_CHECK_INTERVAL = 500L
 		private const val CF_CLEARANCE = "cf_clearance"
 	}
 }

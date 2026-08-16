@@ -5,7 +5,6 @@ import okhttp3.Interceptor
 import okhttp3.Response
 import org.koitharu.kotatsu.core.cache.MemoryContentCache
 import org.koitharu.kotatsu.core.exceptions.CloudFlareException
-import org.koitharu.kotatsu.core.exceptions.CloudFlareProtectedException
 import org.koitharu.kotatsu.core.exceptions.InteractiveActionRequiredException
 import org.koitharu.kotatsu.core.exceptions.ProxyConfigException
 import org.koitharu.kotatsu.core.prefs.SourceSettings
@@ -131,9 +130,11 @@ class ParserMangaRepository(
 			}
 		},
 		onFailure = {
+			// Unwrap: the parsers wrap failures, so the Cloudflare/auth signal is usually the cause.
+			// `CloudFlareException` covers both the captcha and the hard-block variants — switching
+			// mirrors cannot fix either, and doing so hides the challenge from the resolver.
 			val e = it.cause ?: it
 			when (e) {
-				is CloudFlareProtectedException,
 				is CloudFlareException,
 				is AuthRequiredException,
 				is InteractiveActionRequiredException,

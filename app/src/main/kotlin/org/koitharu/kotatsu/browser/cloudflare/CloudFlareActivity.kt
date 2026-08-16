@@ -23,7 +23,6 @@ import org.koitharu.kotatsu.core.exceptions.resolve.CaptchaHandler
 import org.koitharu.kotatsu.core.model.MangaSource
 import org.koitharu.kotatsu.core.nav.AppRouter
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
-import org.koitharu.kotatsu.core.network.webview.WebViewExecutor
 import org.koitharu.kotatsu.core.parser.ParserMangaRepository
 import org.koitharu.kotatsu.core.util.ext.getDisplayMessage
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
@@ -44,9 +43,6 @@ class CloudFlareActivity : BaseBrowserActivity(), CloudFlareCallback {
 	@Inject
 	lateinit var captchaHandler: CaptchaHandler
 
-	@Inject
-	lateinit var webViewExecutor: WebViewExecutor
-
 	private lateinit var cfClient: CloudFlareClient
 
 	override fun onCreate2(savedInstanceState: Bundle?, source: MangaSource, repository: ParserMangaRepository?) {
@@ -56,11 +52,7 @@ class CloudFlareActivity : BaseBrowserActivity(), CloudFlareCallback {
 			finishAfterTransition()
 			return
 		}
-		val userAgent = repository?.getRequestHeaders()?.get(org.koitharu.kotatsu.core.network.CommonHeaders.USER_AGENT)
-			.orEmpty()
-			.ifEmpty { webViewExecutor.defaultUserAgent }
-		viewBinding.webView.settings.userAgentString = userAgent
-		cfClient = CloudFlareClient(cookieJar, this, adBlock, url, userAgent = userAgent)
+		cfClient = CloudFlareClient(cookieJar, this, adBlock, url)
 		viewBinding.webView.webViewClient = cfClient
 		lifecycleScope.launch {
 			try {
@@ -98,6 +90,15 @@ class CloudFlareActivity : BaseBrowserActivity(), CloudFlareCallback {
 	override fun finish() {
 		setResult(pendingResult)
 		super.finish()
+	}
+
+	override fun onDestroy() {
+		// The client polls the cookie store on a Handler and holds this activity as its callback,
+		// so it has to be told the screen is gone or it keeps ticking after the user walks away.
+		if (::cfClient.isInitialized) {
+			cfClient.dispose()
+		}
+		super.onDestroy()
 	}
 
 	override fun onLoadingStateChanged(isLoading: Boolean) = Unit

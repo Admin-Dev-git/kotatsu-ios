@@ -349,9 +349,6 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
 	val isAdBlockEnabled: Boolean
 		get() = prefs.getBoolean(KEY_ADBLOCK, false)
 
-	val isAutoCaptchaEnabled: Boolean
-		get() = prefs.getBoolean(KEY_AUTO_CAPTCHA, true)
-
 	var userSpecifiedMangaDirectories: Set<File>
 		get() {
 			val set = prefs.getStringSet(KEY_LOCAL_MANGA_DIRS, emptySet()).orEmpty()
@@ -462,6 +459,10 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
 	var isSSLBypassEnabled: Boolean
 		get() = prefs.getBoolean(KEY_SSL_BYPASS, false)
 		set(value) = prefs.edit { putBoolean(KEY_SSL_BYPASS, value) }
+
+	var isAutoCaptchaEnabled: Boolean
+		get() = prefs.getBoolean(KEY_AUTO_CAPTCHA, true)
+		set(value) = prefs.edit { putBoolean(KEY_AUTO_CAPTCHA, value) }
 
 	val proxyType: Proxy.Type
 		get() {
@@ -667,7 +668,6 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
 		const val TRACK_FAVOURITES = "favourites"
 
 		const val KEY_ADBLOCK = "adblock"
-		const val KEY_AUTO_CAPTCHA = "auto_captcha"
 		const val KEY_LIST_MODE = "list_mode_2"
 		const val KEY_LIST_MODE_HISTORY = "list_mode_history"
 		const val KEY_LIST_MODE_FAVORITES = "list_mode_favorites"
@@ -778,6 +778,7 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
 		const val KEY_UPDATES_UNSTABLE = "updates_unstable"
 		const val KEY_TIPS_CLOSED = "tips_closed"
 		const val KEY_SSL_BYPASS = "ssl_bypass"
+		const val KEY_AUTO_CAPTCHA = "auto_captcha"
 		const val KEY_READER_AUTOSCROLL_SPEED = "as_speed"
 		const val KEY_READER_AUTOSCROLL_FAB = "as_fab"
 		const val KEY_MIRROR_SWITCHING = "mirror_switching"
