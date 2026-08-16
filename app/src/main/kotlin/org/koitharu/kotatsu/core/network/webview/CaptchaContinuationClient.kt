@@ -5,8 +5,8 @@ import android.os.Handler
 import android.os.Looper
 import android.webkit.CookieManager
 import android.webkit.WebView
-import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
 import kotlin.coroutines.Continuation
@@ -60,21 +60,23 @@ class CaptchaContinuationClient(
 
 	private fun isClearanceObtained(): Boolean {
 		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
-		return clearance != null && clearance != oldClearance
+		return !clearance.isNullOrBlank() && clearance != oldClearance
 	}
 
 	/**
 	 * Sync cookies from Android WebView CookieManager back into OkHttp's CookieJar.
 	 * This ensures cf_clearance obtained by the WebView is available to OkHttp requests.
+	 *
+	 * Parsing goes through [AndroidCookieJar.parseWebViewCookie] so the cookie keeps the identity the
+	 * server gave it; a bare parse stores a second, directory-scoped copy that then travels alongside
+	 * the real one and gets the pair rejected.
 	 */
 	private fun syncCookiesFromWebView() {
 		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
 		val cookieString = cookieManager.getCookie(targetUrl) ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
-			val trimmed = raw.trim()
-			if (trimmed.isEmpty()) return@mapNotNull null
-			Cookie.parse(httpUrl, trimmed)
+			AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)

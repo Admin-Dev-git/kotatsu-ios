@@ -23,12 +23,14 @@ import android.net.ConnectivityManager
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.View
 import android.view.ViewPropertyAnimator
 import android.webkit.CookieManager
 import android.webkit.WebView
 import androidx.activity.result.ActivityResultLauncher
 import androidx.annotation.CheckResult
 import androidx.annotation.IntegerRes
+import androidx.annotation.MainThread
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.appcompat.app.AppCompatDialog
@@ -223,6 +225,39 @@ fun WebView.configureForParser(userAgentOverride: String?) = with(settings) {
 	cookieManager.setAcceptCookie(true)
 	cookieManager.setAcceptThirdPartyCookies(this@configureForParser, true)
 }
+
+/**
+ * Give a WebView that is not part of any layout a real size.
+ *
+ * An unmeasured WebView is 0×0, so every `getBoundingClientRect()` inside it is empty: Cloudflare's
+ * Turnstile widget counts as invisible and refuses to complete, coordinate extraction returns
+ * nothing, and synthesised touches all land on (0, 0). Attaching to a window is still preferable
+ * (it also fixes `visibilityState` and `requestAnimationFrame`); this is the fallback for when there
+ * is no activity window to attach to, and it is harmless when there is.
+ */
+@MainThread
+fun WebView.layoutOffscreen(widthPx: Int, heightPx: Int) {
+	if (widthPx <= 0 || heightPx <= 0) return
+	if (isAttachedToWindow && width > 0 && height > 0) return
+	measure(
+		View.MeasureSpec.makeMeasureSpec(widthPx, View.MeasureSpec.EXACTLY),
+		View.MeasureSpec.makeMeasureSpec(heightPx, View.MeasureSpec.EXACTLY),
+	)
+	layout(0, 0, widthPx, heightPx)
+}
+
+/** Sizes the WebView to the device display, which is what a real browser tab would report. */
+@MainThread
+fun WebView.layoutOffscreen() {
+	val metrics = resources.displayMetrics
+	layoutOffscreen(
+		widthPx = metrics.widthPixels.coerceIn(MIN_OFFSCREEN_SIZE_PX, MAX_OFFSCREEN_SIZE_PX),
+		heightPx = metrics.heightPixels.coerceIn(MIN_OFFSCREEN_SIZE_PX, MAX_OFFSCREEN_SIZE_PX),
+	)
+}
+
+private const val MIN_OFFSCREEN_SIZE_PX = 320
+private const val MAX_OFFSCREEN_SIZE_PX = 2560
 
 fun Context.restartApplication() {
 	val activity = findActivity()

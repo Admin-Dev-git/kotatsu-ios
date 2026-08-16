@@ -12,13 +12,18 @@ import org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity
  * - We therefore combine: stealth anti-detection, synthetic pointer events on widgets,
  *   label/checkbox clicks, shadow-DOM probing, form submits, and a continuous retry loop.
  *
- * The stealth script is critical: the OkHttp stack impersonates a Windows desktop
- * Chrome 133 (TLS-PSK profile + Windows UA). The system WebView, however, runs on
- * Android and leaks `navigator.platform` ("Linux aarch64"), `navigator.userAgentData`
- * (mobile), WebGL renderer (Mali/Adreno), screen dimensions and touch points — all of
- * which Cloudflare correlates with the UA and flags as a bot. [stealthScript] rewrites
- * every one of those signals to form a self-consistent Windows Chrome 133 identity and
- * is injected at document-start (before any page script, in every frame).
+ * The stealth script's job is *consistency*, not disguise. Cloudflare does not score a single
+ * signal; it correlates the UA against `navigator.platform`, `userAgentData`, touch points,
+ * `screen`, the WebGL renderer and the pointer/hover media queries. Claiming desktop Chrome from
+ * an Android [android.webkit.WebView] loses that comparison every time — the WebView cannot hide
+ * touch support or its GPU — and clearance issued to a contradictory client is rejected on the
+ * very next request, which is the loop this file exists to end. So [stealthScript] derives every
+ * value it defines from the UA it is given ([org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity.USER_AGENT],
+ * an Android Chrome UA), and leaves anything it cannot make consistent alone. It only masks the
+ * signals that are automation tells rather than platform facts: `navigator.webdriver`, the missing
+ * `window.chrome`, an empty plugin list.
+ *
+ * Must be injected at document-start (before any page script, in every frame).
  */
 internal object CaptchaSolverScript {
 
@@ -33,14 +38,57 @@ internal object CaptchaSolverScript {
 	 */
 	fun stealthScript(userAgent: String): String = buildStealthScript(userAgent)
 
-	/** Backwards-compatible constant — uses the canonical Windows Chrome 133 UA. */
+	/** The canonical script for [ChromeTlsIdentity.USER_AGENT] — the same Android Chrome the network stack sends. */
 	@Suppress("ObjectPropertyName")
 	val STEALTH_SCRIPT: String = stealthScript(ChromeTlsIdentity.USER_AGENT)
+
+	/**
+	 * Renders [value] as a JavaScript string literal.
+	 *
+	 * The UA has to reach the script as data, not as concatenated source: an unescaped quote or
+	 * backslash would break the whole IIFE, and a broken stealth script fails *silently* — the
+	 * WebView reports its real Android identity while the network stack claims something else, which
+	 * is precisely the contradiction Cloudflare punishes. Not hypothetical: the previous revision
+	 * built this line from a JS-style `JSON.stringify(ua)` template that Kotlin never interpolated,
+	 * so every injection threw a SyntaxError and no stealth was ever applied.
+	 */
+	private fun jsString(value: String): String = buildString(value.length + 2) {
+		append('"')
+		for (c in value) {
+			when (c) {
+				'"' -> append("\\\"")
+				'\\' -> append("\\\\")
+				'\n' -> append("\\n")
+				'\r' -> append("\\r")
+				else -> if (c.code < 0x20 || c.code == 0x2028 || c.code == 0x2029) {
+					// Control chars, plus the two separators that terminate a line for some parsers.
+					append("\\u").append(c.code.toString(16).padStart(4, '0'))
+				} else {
+					append(c)
+				}
+			}
+		}
+		append('"')
+	}
 
 	private fun buildStealthScript(ua: String): String = """
 		(function() {
 			try {
-				var reportedUA = ${'$'}{JSON.stringify(ua)};
+				var reportedUA = ${jsString(ua)};
+
+				// Client-hint values for an Android UA are read straight out of it, so
+				// platform-version / model can never disagree with the UA string itself.
+				var androidVersion = '14.0.0';
+				var androidModel = 'K';
+				try {
+					var am = reportedUA.match(/Android (\d+(?:\.\d+)*)(?:; ([^;)]+))?/);
+					if (am) {
+						var parts = am[1].split('.');
+						while (parts.length < 3) { parts.push('0'); }
+						androidVersion = parts.slice(0, 3).join('.');
+						if (am[2]) { androidModel = am[2].trim(); }
+					}
+				} catch (e) {}
 
 				// Resolve a platform / client-hints identity consistent with the UA.
 				var platform, chPlatform, mobile;
@@ -74,8 +122,9 @@ internal object CaptchaSolverScript {
 					catch (e) {}
 				}
 
-				// navigator.webdriver — the #1 bot detection signal
-				defineNav('webdriver', function() { return undefined; });
+				// navigator.webdriver — the #1 automation signal. Real Chrome defines it and
+				// reports false; `undefined` is itself unusual, so answer the way Chrome does.
+				defineNav('webdriver', function() { return false; });
 
 				// navigator.userAgent/appVersion — WebSettings already spoofs userAgent,
 				// but redefine for belts-and-braces consistency.
@@ -99,17 +148,26 @@ internal object CaptchaSolverScript {
 					window.chrome.runtime = {};
 				}
 
-				// navigator.plugins — real Chrome has plugins, headless has none.
-				defineNav('plugins', function() {
-					var a = [1, 2, 3, 4, 5];
-					a.item = function(i) { return this[i]; };
-					a.namedItem = function() { return null; };
-					a.refresh = function() {};
-					return a;
-				});
+				// navigator.plugins — a *desktop* Chrome always exposes the bundled PDF viewer
+				// entries, so an empty list there is a headless tell. Chrome on Android exposes
+				// none at all, so on mobile the honest empty list is the consistent answer.
+				if (!mobile) {
+					defineNav('plugins', function() {
+						var a = [1, 2, 3, 4, 5];
+						a.item = function(i) { return this[i]; };
+						a.namedItem = function() { return null; };
+						a.refresh = function() {};
+						return a;
+					});
+				}
 				defineNav('languages', function() { return ['en-US', 'en']; });
-				defineNav('hardwareConcurrency', function() { return 8; });
-				defineNav('deviceMemory', function() { return 8; });
+				// CPU / memory: the device's real values are already plausible for the Android UA
+				// we send, and a fixed pair would only add a contradiction (an 8-core, 8 GB phone
+				// whose GPU and screen say otherwise). Override for a desktop UA only.
+				if (!mobile) {
+					defineNav('hardwareConcurrency', function() { return 8; });
+					defineNav('deviceMemory', function() { return 8; });
+				}
 
 				// Permissions API — Cloudflare probes the notification permission.
 				if (navigator.permissions && navigator.permissions.query) {
@@ -132,7 +190,13 @@ internal object CaptchaSolverScript {
 						{ brand: 'Chromium', version: major }
 					];
 					var platformVersion = chPlatform === 'Windows' ? '15.0.0'
-						: chPlatform === 'macOS' ? '14.3.0' : '10.0.0';
+						: chPlatform === 'macOS' ? '14.3.0'
+						: chPlatform === 'Android' ? androidVersion : '10.0.0';
+					// Architecture and model must agree with the platform: Chrome on Android sends
+					// an empty architecture/bitness and the device model, never x86/64.
+					var architecture = mobile ? '' : 'x86';
+					var bitness = mobile ? '' : '64';
+					var model = mobile ? androidModel : '';
 					var uad = {
 						brands: brands,
 						mobile: mobile,
@@ -143,9 +207,9 @@ internal object CaptchaSolverScript {
 								mobile: mobile,
 								platform: chPlatform,
 								platformVersion: platformVersion,
-								architecture: 'x86',
-								bitness: '64',
-								model: '',
+								architecture: architecture,
+								bitness: bitness,
+								model: model,
 								uaFullVersion: major + '.0.0.0',
 								fullVersionList: brands,
 								wow64: false
@@ -156,7 +220,10 @@ internal object CaptchaSolverScript {
 					defineNav('userAgentData', function() { return uad; });
 				} catch (e) {}
 
-				// Screen / device pixel ratio — keep a coherent desktop profile.
+				// Screen metrics: only invented for a desktop UA. On Android the WebView's own
+				// values already match the UA, and overriding them (1920x1080 at dpr 1 on a phone)
+				// contradicts the pointer/hover media queries and touch support the WebView cannot
+				// hide — the kind of mismatch that gets clearance revoked a request later.
 				if (!mobile) {
 					defineConst(screen, 'width', 1920);
 					defineConst(screen, 'height', 1080);
@@ -167,23 +234,45 @@ internal object CaptchaSolverScript {
 					defineConst(window, 'devicePixelRatio', 1);
 				}
 
-				// WebGL vendor / renderer — Android GPUs (Mali/Adreno/SwiftShader) are an
-				// instant mobile giveaway; rewrite to a desktop ANGLE/Intel identity.
+				// WebGL vendor / renderer. Only rewritten when it would otherwise contradict the UA:
+				// for the Android UA we send, a real Adreno/Mali string is exactly right and must be
+				// left alone. The one Android value worth replacing is the software renderer an
+				// emulator or a GPU-less device reports — "SwiftShader" says "no real device" as
+				// loudly as navigator.webdriver does.
 				try {
 					var VENDOR = 0x1F00, RENDERER = 0x1F01;
 					var UNMASKED_VENDOR = 0x9245, UNMASKED_RENDERER = 0x9246;
-					var webglVendor = 'Google Inc. (Intel)';
-					var webglRenderer =
-						'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+					var webglVendor, webglRenderer;
+					if (mobile) {
+						webglVendor = 'Qualcomm';
+						webglRenderer = 'Adreno (TM) 730';
+					} else {
+						webglVendor = 'Google Inc. (Intel)';
+						webglRenderer =
+							'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+					}
+					function needsRewrite(actual) {
+						if (!mobile) return true;
+						if (typeof actual !== 'string' || actual === '') return true;
+						var a = actual.toLowerCase();
+						return a.indexOf('swiftshader') !== -1 ||
+							a.indexOf('software') !== -1 ||
+							a.indexOf('llvmpipe') !== -1 ||
+							a.indexOf('mesa') !== -1;
+					}
 					function patch(proto) {
 						if (!proto || !proto.getParameter) return;
 						var orig = proto.getParameter.bind(proto);
 						proto.getParameter = function(p) {
 							try {
-								if (p === VENDOR) return webglVendor;
-								if (p === RENDERER) return webglRenderer;
-								if (p === UNMASKED_VENDOR) return webglVendor;
-								if (p === UNMASKED_RENDERER) return webglRenderer;
+								if (p === VENDOR || p === UNMASKED_VENDOR) {
+									var av = orig(p);
+									return needsRewrite(av) ? webglVendor : av;
+								}
+								if (p === RENDERER || p === UNMASKED_RENDERER) {
+									var ar = orig(p);
+									return needsRewrite(ar) ? webglRenderer : ar;
+								}
 							} catch (e) {}
 							return orig(p);
 						};
@@ -221,7 +310,37 @@ internal object CaptchaSolverScript {
 			function dispatchClick(el) {
 				if (!el) return false;
 				try {
-					var opts = { bubbles: true, cancelable: true, view: window };
+					var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: 0, top: 0, width: 20, height: 20 };
+					var clientX = rect.left + (rect.width / 2);
+					var clientY = rect.top + (rect.height / 2);
+					var opts = {
+						bubbles: true,
+						cancelable: true,
+						view: window,
+						clientX: clientX,
+						clientY: clientY,
+						screenX: clientX,
+						screenY: clientY,
+						pointerType: 'touch',
+						pressure: 0.5,
+						width: 20,
+						height: 20
+					};
+					try {
+						if (typeof window.TouchEvent === 'function') {
+							var touch = new Touch({
+								identifier: Date.now(),
+								target: el,
+								clientX: clientX,
+								clientY: clientY,
+								radiusX: 10,
+								radiusY: 10,
+								force: 0.5
+							});
+							el.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, touches: [touch], targetTouches: [touch], changedTouches: [touch] }));
+							el.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [touch] }));
+						}
+					} catch (te) {}
 					el.dispatchEvent(new PointerEvent('pointerdown', opts));
 					el.dispatchEvent(new MouseEvent('mousedown', opts));
 					el.dispatchEvent(new PointerEvent('pointerup', opts));
@@ -500,6 +619,45 @@ internal object CaptchaSolverScript {
 				return hasChallenge ? 'true' : 'false';
 			} catch (e) {
 				return 'false';
+			}
+		})();
+	""".trimIndent()
+
+	/**
+	 * Extracts the screen-space DP coordinates of the Turnstile / challenge checkbox
+	 * so native Android MotionEvents (hardware touch) can be dispatched with isTrusted=true.
+	 */
+	val GET_WIDGET_COORDINATES_SCRIPT: String = """
+		(function() {
+			try {
+				var selectors = [
+					'iframe[src*="challenges.cloudflare.com"]',
+					'iframe[src*="turnstile"]',
+					'iframe[title*="Cloudflare"]',
+					'iframe[title*="Widget containing a Cloudflare"]',
+					'div.cf-turnstile',
+					'div#turnstile-wrapper',
+					'div.cf-turnstile-wrapper',
+					'[data-turnstile-sitekey]',
+					'#challenge-stage input[type="checkbox"]',
+					'.ctp-checkbox-label',
+					'#challenge-stage'
+				];
+				for (var i = 0; i < selectors.length; i++) {
+					var el = document.querySelector(selectors[i]);
+					if (el) {
+						var rect = el.getBoundingClientRect();
+						if (rect.width > 0 && rect.height > 0) {
+							// Checkbox is ~28px from left edge and vertically centered in Turnstile
+							var x = rect.left + Math.min(28, rect.width / 2);
+							var y = rect.top + (rect.height / 2);
+							return x + ',' + y;
+						}
+					}
+				}
+				return null;
+			} catch (e) {
+				return null;
 			}
 		})();
 	""".trimIndent()

@@ -20,16 +20,17 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.core.exceptions.CloudFlareException
 import org.koitharu.kotatsu.core.network.CommonHeaders
+import org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.core.network.proxy.ProxyProvider
 import org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity
 import org.koitharu.kotatsu.core.parser.MangaRepository
 import org.koitharu.kotatsu.core.parser.ParserMangaRepository
 import org.koitharu.kotatsu.core.util.ext.configureForParser
+import org.koitharu.kotatsu.core.util.ext.layoutOffscreen
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
 import org.koitharu.kotatsu.parsers.model.MangaSource
 import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
@@ -146,8 +147,7 @@ class WebViewExecutor @Inject constructor(
 						android.webkit.CookieManager.getInstance().flush()
 						syncCookiesFromWebView(exception.url)
 					} finally {
-						startScriptHandler?.remove()
-						startScriptHandler = null
+						removeDocumentStartStealth()
 						webView.reset()
 					}
 				}
@@ -179,15 +179,17 @@ class WebViewExecutor @Inject constructor(
 	/**
 	 * Sync cookies from Android WebView CookieManager back to OkHttp CookieJar
 	 * to ensure cf_clearance and other session cookies are available.
+	 *
+	 * Parsing goes through [AndroidCookieJar.parseWebViewCookie]: the WebView hides every cookie
+	 * attribute, and a bare parse would store a second copy of the clearance scoped to the challenge
+	 * URL's directory. Two copies in one request is what Cloudflare rejects.
 	 */
 	private fun syncCookiesFromWebView(url: String) {
 		val httpUrl = url.toHttpUrlOrNull() ?: return
 		val cookieManager = android.webkit.CookieManager.getInstance()
 		val cookieString = cookieManager.getCookie(url) ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
-			val trimmed = raw.trim()
-			if (trimmed.isEmpty()) return@mapNotNull null
-			Cookie.parse(httpUrl, trimmed)
+			AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)
@@ -212,6 +214,9 @@ class WebViewExecutor @Inject constructor(
 				// as an instant bot signal and never issues cf_clearance.
 				// Attach (invisible) to the visible activity window instead.
 				attachToWindow(webView)
+				// Fallback for when there is no foreground activity to attach to: an unmeasured
+				// WebView is 0×0, which makes the challenge widget invisible to itself.
+				webView.layoutOffscreen()
 				webView.onResume()
 				webView.resumeTimers()
 			}
@@ -252,8 +257,7 @@ class WebViewExecutor @Inject constructor(
 	 */
 	@MainThread
 	private fun installDocumentStartStealth(webView: WebView, userAgent: String) {
-		startScriptHandler?.remove()
-		startScriptHandler = null
+		removeDocumentStartStealth()
 		if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
 		runCatching {
 			startScriptHandler = WebViewCompat.addDocumentStartJavaScript(
@@ -262,6 +266,18 @@ class WebViewExecutor @Inject constructor(
 				setOf("*"),
 			)
 		}.onFailure { it.printStackTraceDebug() }
+	}
+
+	/**
+	 * `ScriptHandler.remove` itself requires DOCUMENT_START_SCRIPT. The handler can only be non-null
+	 * when the feature was available, but re-checking keeps that guarantee local instead of implied.
+	 */
+	@MainThread
+	private fun removeDocumentStartStealth() {
+		val handler = startScriptHandler ?: return
+		startScriptHandler = null
+		if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
+		runCatching { handler.remove() }.onFailure { it.printStackTraceDebug() }
 	}
 
 	private fun MangaSource.getUserAgent(): String? {
@@ -282,7 +298,11 @@ class WebViewExecutor @Inject constructor(
 	}
 
 	companion object {
-		private const val MAX_RESOLVE_ATTEMPTS = 3
+		/**
+		 * Two attempts at 45 s + 55 s already keeps the caller waiting for the better part of two
+		 * minutes; a third only delays the visible resolve screen the user needs anyway.
+		 */
+		private const val MAX_RESOLVE_ATTEMPTS = 2
 		private const val RETRY_TIMEOUT_INCREMENT = 10_000L // Add 10s per retry
 		/** Nearly invisible but still rendered/attached — Turnstile needs a real window. */
 		private const val INVISIBLE_ALPHA = 0.01f

@@ -46,8 +46,8 @@ import org.koitharu.kotatsu.core.model.isNsfw
 import org.koitharu.kotatsu.core.nav.AppRouter
 import org.koitharu.kotatsu.core.network.webview.AutoCaptchaSolver
 import org.koitharu.kotatsu.core.network.webview.WebViewExecutor
-import org.koitharu.kotatsu.core.prefs.AppSettings
 import org.koitharu.kotatsu.core.parser.favicon.faviconUri
+import org.koitharu.kotatsu.core.prefs.AppSettings
 import org.koitharu.kotatsu.core.prefs.SourceSettings
 import org.koitharu.kotatsu.core.util.ext.checkNotificationPermission
 import org.koitharu.kotatsu.core.util.ext.getNotificationIconSize
@@ -75,6 +75,9 @@ class CaptchaHandler @Inject constructor(
 ) : EventListener() {
 
 	private val exceptionMap = MutableScatterMap<MangaSource, CloudFlareProtectedException>()
+	private val autoSolveFailures = MutableScatterMap<MangaSource, Long>()
+	private val lastResolution = MutableScatterMap<MangaSource, Long>()
+	private val repromptSuppressedUntil = MutableScatterMap<MangaSource, Long>()
 	private val mutex = Mutex()
 
 	@CheckResult
@@ -111,27 +114,44 @@ class CaptchaHandler @Inject constructor(
 		if (source == UnknownMangaSource) {
 			return@withContext false
 		}
-		// Try auto captcha solver first (if enabled)
-		if (exception is CloudFlareProtectedException && settings.isAutoCaptchaEnabled) {
-			if (autoCaptchaSolver.trySolve(exception, AUTO_SOLVE_TIMEOUT)) {
+		// A challenge that arrives right after this source was solved means the clearance is not being
+		// honoured; prompting again would just restart the cycle. Detected once, then kept quiet.
+		val isRepromptSuppressed = exception != null && isRepromptSuppressed(source)
+		if (exception != null && !isRepromptSuppressed && !isAutoSolveOnCooldown(source)) {
+			// Exactly one headless attempt per cooldown window. Chaining the script-injecting
+			// solver with the bare `tryResolveCaptcha` pass only added minutes of delay and more
+			// requests to an endpoint Cloudflare is already challenging — which is what escalated
+			// a solvable challenge into a hard block and made the captcha come back forever.
+			val solved = if (exception is CloudFlareProtectedException && settings.isAutoCaptchaEnabled) {
+				autoCaptchaSolver.trySolve(exception, AUTO_SOLVE_TIMEOUT)
+			} else {
+				webViewExecutor.tryResolveCaptcha(exception, RESOLVE_TIMEOUT)
+			}
+			if (solved) {
+				onCaptchaSolved(source)
 				return@withContext true
 			}
-		}
-		// Fall back to existing WebView resolution
-		if (exception != null && webViewExecutor.tryResolveCaptcha(exception, RESOLVE_TIMEOUT)) {
-			return@withContext true
+			markAutoSolveFailed(source)
 		}
 		mutex.withLock {
 			var removedException: CloudFlareProtectedException? = null
 			if (exception is CloudFlareProtectedException) {
 				exceptionMap[source] = exception
 			} else {
+				// No exception means the challenge was resolved (or dismissed) elsewhere — e.g. the
+				// user solved it in CloudFlareActivity — so the headless cooldown no longer applies.
 				removedException = exceptionMap.remove(source)
+				autoSolveFailures.remove(source)
+				// A deliberate solve deserves a fresh chance: drop any active backoff, and record when
+				// it happened so a challenge arriving straight afterwards is recognised as clearance
+				// that never worked.
+				repromptSuppressedUntil.remove(source)
+				lastResolution[source] = System.currentTimeMillis()
 			}
 			val dao = databaseProvider.get().getSourcesDao()
 			dao.setCfState(source.name, exception?.state ?: CloudFlareHelper.PROTECTION_NOT_DETECTED)
 
-			if (notify && context.checkNotificationPermission(CHANNEL_ID)) {
+			if (notify && !isRepromptSuppressed && context.checkNotificationPermission(CHANNEL_ID)) {
 				val exceptions = dao.findAllCaptchaRequired().mapNotNull {
 					it.source.toMangaSourceOrNull()
 				}.filterNot {
@@ -146,6 +166,72 @@ class CaptchaHandler @Inject constructor(
 			}
 		}
 		false
+	}
+
+	/**
+	 * True while a headless solve attempt for [source] failed less than [AUTO_SOLVE_COOLDOWN] ago.
+	 * Without this, every retried request re-runs the whole solve pipeline, so a challenge that
+	 * genuinely needs a human turns into an endless silent retry loop. Returning `false` from
+	 * [handleException] instead leaves the notification up, which opens `CloudFlareActivity`.
+	 */
+	private suspend fun isAutoSolveOnCooldown(source: MangaSource): Boolean = mutex.withLock {
+		val lastFailure = autoSolveFailures[source] ?: return@withLock false
+		val elapsed = System.currentTimeMillis() - lastFailure
+		if (elapsed in 0..AUTO_SOLVE_COOLDOWN) {
+			true
+		} else {
+			autoSolveFailures.remove(source)
+			false
+		}
+	}
+
+	private suspend fun markAutoSolveFailed(source: MangaSource) = mutex.withLock {
+		autoSolveFailures[source] = System.currentTimeMillis()
+	}
+
+	/**
+	 * True when a captcha prompt for [source] would only repeat one the user has already answered.
+	 *
+	 * A challenge arriving within [POST_RESOLVE_WINDOW] of a solve means the clearance that solve
+	 * produced is not being honoured at all — solving it again cannot change that, and re-prompting is
+	 * exactly the "it wants to solve it again and again" behaviour. The first such challenge arms
+	 * [REPROMPT_BACKOFF] of quiet; the error is then reported normally, and the in-app retry action
+	 * still opens the resolve screen whenever the user asks for it.
+	 */
+	private suspend fun isRepromptSuppressed(source: MangaSource): Boolean = mutex.withLock {
+		val now = System.currentTimeMillis()
+		val suppressedUntil = repromptSuppressedUntil[source]
+		if (suppressedUntil != null) {
+			if (now < suppressedUntil) {
+				return@withLock true
+			}
+			repromptSuppressedUntil.remove(source)
+		}
+		val last = lastResolution[source] ?: return@withLock false
+		if (now - last in 0..POST_RESOLVE_WINDOW) {
+			lastResolution.remove(source)
+			repromptSuppressedUntil[source] = now + REPROMPT_BACKOFF
+			true
+		} else {
+			lastResolution.remove(source)
+			false
+		}
+	}
+
+	private suspend fun onCaptchaSolved(source: MangaSource) {
+		mutex.withLock {
+			val removed = exceptionMap.remove(source)
+			autoSolveFailures.remove(source)
+			repromptSuppressedUntil.remove(source)
+			lastResolution[source] = System.currentTimeMillis()
+			val dao = databaseProvider.get().getSourcesDao()
+			dao.setCfState(source.name, CloudFlareHelper.PROTECTION_NOT_DETECTED)
+			if (context.checkNotificationPermission(CHANNEL_ID)) {
+				if (removed != null) {
+					NotificationManagerCompat.from(context).cancel(TAG, source.hashCode())
+				}
+			}
+		}
 	}
 
 	@RequiresPermission(Manifest.permission.POST_NOTIFICATIONS)
@@ -299,7 +385,9 @@ class CaptchaHandler @Inject constructor(
 		private const val SETTINGS_ACTION_CODE = 3
 		private const val ACTION_DISCARD = "org.koitharu.kotatsu.CAPTCHA_DISCARD"
 		private const val RESOLVE_TIMEOUT = 45_000L
-		/** Timeout for [AutoCaptchaSolver] first-line attempt (Turnstile often needs 20–35s). */
 		private const val AUTO_SOLVE_TIMEOUT = 35_000L
+		private const val AUTO_SOLVE_COOLDOWN = 60_000L
+		private const val POST_RESOLVE_WINDOW = 45_000L
+		private const val REPROMPT_BACKOFF = 300_000L
 	}
 }

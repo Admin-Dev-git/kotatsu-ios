@@ -28,6 +28,12 @@ class RetryInterceptor(
 				if (response.isSuccessful || response.code !in RETRYABLE_HTTP_CODES) {
 					return response
 				}
+				// A Cloudflare challenge is commonly served as 503. Retrying it hammers the
+				// challenge endpoint and escalates the source from "challenged" to "blocked";
+				// let CloudFlareInterceptor classify the response instead.
+				if (response.isCloudFlareChallenge()) {
+					return response
+				}
 				if (attempt == maxRetries - 1) {
 					return response
 				}
@@ -42,6 +48,10 @@ class RetryInterceptor(
 			sleepBackoff(attempt)
 		}
 		throw lastException ?: IOException("Request failed after $maxRetries attempts")
+	}
+
+	private fun Response.isCloudFlareChallenge(): Boolean {
+		return header("server")?.contains("cloudflare", ignoreCase = true) == true
 	}
 
 	private fun sleepBackoff(attempt: Int) {

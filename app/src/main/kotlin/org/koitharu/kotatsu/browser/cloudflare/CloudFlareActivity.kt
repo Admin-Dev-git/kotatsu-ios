@@ -92,6 +92,15 @@ class CloudFlareActivity : BaseBrowserActivity(), CloudFlareCallback {
 		super.finish()
 	}
 
+	override fun onDestroy() {
+		// The client polls the cookie store on a Handler and holds this activity as its callback,
+		// so it has to be told the screen is gone or it keeps ticking after the user walks away.
+		if (::cfClient.isInitialized) {
+			cfClient.dispose()
+		}
+		super.onDestroy()
+	}
+
 	override fun onLoadingStateChanged(isLoading: Boolean) = Unit
 
 	override fun onPageLoaded() {
