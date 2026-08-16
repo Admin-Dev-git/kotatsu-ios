@@ -34,10 +34,6 @@ permissions:
   contents: read
 
 env:
-  # Keystore alias/name and passwords for the debug.keystore committed to the repo.
-  # CI only — do not use for production distribution.
-  KEYSTORE_ALIAS: debug
-  KEYSTORE_PASSWORD: android
   # kotatsu-parsers repo to publish from (change to clawzex/kotatsu-parsers for your fork)
   PARSERS_REPO: Admin-Dev-git/kotatsu-parsers
   GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx2g -Dorg.gradle.daemon=false
@@ -85,18 +81,23 @@ jobs:
         working-directory: kotatsu-ios
         run: echo "sdk.dir=${ANDROID_SDK_ROOT}" >> local.properties
 
-      - name: Create keystore for release signing
-        # The debug.keystore is committed to the repo. Its base64 representation is stored
-        # as a GitHub Actions secret named KOTATSU_KEYSTORE_B64 (Settings → Secrets → Actions).
-        # Generate with: cat app/debug.keystore | base64 | tr -d '\n'
+      - name: Resolve keystore for release signing
+        # app/debug.keystore is committed to the repo and app/build.gradle points its `debug`
+        # signingConfig straight at it, so a plain checkout can already sign. The optional
+        # KOTATSU_KEYSTORE_B64 secret overrides that file when you would rather keep the key out of
+        # the tree — generate it with: cat app/debug.keystore | base64 | tr -d '\n'
         env:
           KOTATSU_KEYSTORE_B64: ${{ secrets.KOTATSU_KEYSTORE_B64 }}
         run: |
-          if [[ -z "${KOTATSU_KEYSTORE_B64}" ]]; then
-            echo "::error::KOTATSU_KEYSTORE_B64 secret is not set. Add it in GitHub repo Settings → Secrets and Actions."
+          if [[ -n "${KOTATSU_KEYSTORE_B64}" ]]; then
+            echo "${KOTATSU_KEYSTORE_B64}" | base64 -d > kotatsu-ios/app/debug.keystore
+            echo "Signing with the keystore from the KOTATSU_KEYSTORE_B64 secret."
+          elif [[ -s kotatsu-ios/app/debug.keystore ]]; then
+            echo "Signing with the debug.keystore committed to the repository."
+          else
+            echo "::error::No keystore available: KOTATSU_KEYSTORE_B64 is unset and app/debug.keystore is missing."
             exit 1
           fi
-          echo "${KOTATSU_KEYSTORE_B64}" | base64 -d > kotatsu-ios/app/debug.keystore
 
       - name: Publish parsers to Maven Local
         working-directory: kotatsu-parsers
@@ -104,15 +105,13 @@ jobs:
 
       - name: Build ${{ github.event.inputs.variant || 'release' }} APK
         working-directory: kotatsu-ios
+        # No -Psigning.* flags: the signingConfig in app/build.gradle hardcodes the store, alias and
+        # passwords, so properties passed here were silently ignored.
         run: |
           ./gradlew \
             assemble${{ github.event.inputs.variant || 'release' }} \
             --no-daemon \
-            --stacktrace \
-            -Psigning.debug.file=app/debug.keystore \
-            -Psigning.debug.keyAlias=${{ env.KEYSTORE_ALIAS }} \
-            -Psigning.debug.storePassword=${{ env.KEYSTORE_PASSWORD }} \
-            -Psigning.debug.keyPassword=${{ env.KEYSTORE_PASSWORD }}
+            --stacktrace
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
