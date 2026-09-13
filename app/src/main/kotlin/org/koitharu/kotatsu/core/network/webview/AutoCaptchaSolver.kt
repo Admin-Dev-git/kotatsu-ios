@@ -22,18 +22,20 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.koitharu.kotatsu.core.exceptions.CloudFlareProtectedException
 import org.koitharu.kotatsu.core.network.CommonHeaders
+import org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.core.network.proxy.ProxyProvider
 import org.koitharu.kotatsu.core.network.tls.ChromeTlsIdentity
 import org.koitharu.kotatsu.core.parser.MangaRepository
 import org.koitharu.kotatsu.core.parser.ParserMangaRepository
 import org.koitharu.kotatsu.core.util.ext.configureForParser
+import org.koitharu.kotatsu.core.util.ext.layoutOffscreen
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
 import org.koitharu.kotatsu.parsers.model.MangaSource
+import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
 import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
 import java.lang.ref.WeakReference
 import javax.inject.Inject
@@ -113,10 +115,16 @@ class AutoCaptchaSolver @Inject constructor(
 	 * @return `true` if the challenge was solved (cf_clearance cookie obtained), `false` otherwise
 	 */
 	suspend fun trySolve(exception: CloudFlareProtectedException, timeout: Long): Boolean = mutex.withLock {
+		// The clearance held before any attempt. A solve is only real if this value changes: the
+		// WebView finishing, the challenge screen disappearing, or the continuation resuming prove
+		// nothing on their own, and reporting success without a new cookie is what made the caller
+		// clear the captcha state, dismiss the notification, retry, get a 403 and prompt all over
+		// again — forever.
+		val clearanceBefore = CloudFlareHelper.getClearanceCookie(cookieJar, exception.url)
 		// Retry a few times — Turnstile widgets often appear after a delay / soft fail.
 		for (attempt in 1..MAX_SOLVE_ATTEMPTS) {
 			val attemptTimeout = timeout + (attempt - 1) * RETRY_TIMEOUT_INCREMENT
-			val result = runCatchingCancellable {
+			runCatchingCancellable {
 				withContext(Dispatchers.Main.immediate) {
 					val webView = obtainWebView()
 					try {
@@ -153,8 +161,7 @@ class AutoCaptchaSolver @Inject constructor(
 						CookieManager.getInstance().flush()
 						syncCookiesFromWebView(exception.url)
 					} finally {
-						startScriptHandler?.remove()
-						startScriptHandler = null
+						removeDocumentStartStealth()
 						webView.reset()
 					}
 				}
@@ -164,7 +171,10 @@ class AutoCaptchaSolver @Inject constructor(
 					exception.addSuppressed(e)
 				}
 			}
-			if (result.isSuccess) return@withLock true
+			val clearanceAfter = CloudFlareHelper.getClearanceCookie(cookieJar, exception.url)
+			if (!clearanceAfter.isNullOrBlank() && clearanceAfter != clearanceBefore) {
+				return@withLock true
+			}
 		}
 		false
 	}
@@ -200,17 +210,17 @@ class AutoCaptchaSolver @Inject constructor(
 	 * Sync cookies from Android WebView CookieManager back to OkHttp CookieJar
 	 * so cf_clearance (and related CF session cookies) are available to network calls.
 	 *
-	 * Uses [Cookie.parse] so domain/path/hostOnly attributes are preserved correctly
-	 * for subsequent requests to the same host.
+	 * Goes through [AndroidCookieJar.parseWebViewCookie]: `CookieManager.getCookie` hides every
+	 * attribute, so a bare [Cookie.parse] scopes the cookie to the challenge URL's directory and
+	 * stores a second copy of a cookie that already exists at `/`. Both are then sent in one request
+	 * and Cloudflare rejects the pair.
 	 */
 	private fun syncCookiesFromWebView(url: String) {
 		val httpUrl = url.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
 		val cookieString = cookieManager.getCookie(url) ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
-			val trimmed = raw.trim()
-			if (trimmed.isEmpty()) return@mapNotNull null
-			Cookie.parse(httpUrl, trimmed)
+			AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)
@@ -238,6 +248,10 @@ class AutoCaptchaSolver @Inject constructor(
 				// as an instant bot signal and never issues cf_clearance.
 				// Attach (invisible) to the visible activity window instead.
 				attachToWindow(webView)
+				// No foreground activity to attach to (background sync, notification-triggered
+				// load): measure and lay the view out by hand so it is at least not 0×0, which
+				// would make the widget invisible and every touch land on (0, 0).
+				webView.layoutOffscreen()
 				webView.onResume()
 				webView.resumeTimers()
 			}
@@ -279,8 +293,7 @@ class AutoCaptchaSolver @Inject constructor(
 	 */
 	@MainThread
 	private fun installDocumentStartStealth(webView: WebView, userAgent: String) {
-		startScriptHandler?.remove()
-		startScriptHandler = null
+		removeDocumentStartStealth()
 		if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
 		runCatching {
 			startScriptHandler = WebViewCompat.addDocumentStartJavaScript(
@@ -289,6 +302,18 @@ class AutoCaptchaSolver @Inject constructor(
 				setOf("*"),
 			)
 		}.onFailure { it.printStackTraceDebug() }
+	}
+
+	/**
+	 * `ScriptHandler.remove` itself requires DOCUMENT_START_SCRIPT. The handler can only be non-null
+	 * when the feature was available, but re-checking keeps that guarantee local instead of implied.
+	 */
+	@MainThread
+	private fun removeDocumentStartStealth() {
+		val handler = startScriptHandler ?: return
+		startScriptHandler = null
+		if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
+		runCatching { handler.remove() }.onFailure { it.printStackTraceDebug() }
 	}
 
 	private fun MangaSource.getUserAgent(): String? {
@@ -309,7 +334,13 @@ class AutoCaptchaSolver @Inject constructor(
 	}
 
 	companion object {
-		private const val MAX_SOLVE_ATTEMPTS = 3
+		/**
+		 * Two, not three. Each attempt costs its full timeout, and a headless WebView that failed the
+		 * same challenge twice is not going to pass it on the third try — it is going to keep the caller
+		 * blocked for another minute and put one more request on an endpoint Cloudflare is already
+		 * challenging. Handing off to the visible screen is both faster and likelier to work.
+		 */
+		private const val MAX_SOLVE_ATTEMPTS = 2
 		private const val RETRY_TIMEOUT_INCREMENT = 5_000L
 		/** Nearly invisible but still rendered/attached — Turnstile needs a real window. */
 		private const val INVISIBLE_ALPHA = 0.01f

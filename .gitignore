@@ -22,6 +22,7 @@
 /.idea/inspectionProfiles/
 .DS_Store
 /build
+/.kotlin
 /captures
 .externalNativeBuild
 .cxx

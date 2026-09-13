@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.core.network.tls
 
+import org.koitharu.kotatsu.parsers.network.UserAgents
+
 /**
  * Chrome browser identity that must stay consistent with [TlsClientManager.TLS_PROFILE].
  * Cloudflare correlates TLS fingerprint, User-Agent, and Client Hints.
@@ -9,15 +11,21 @@ object ChromeTlsIdentity {
 	const val PROFILE = "chrome_133_PSK"
 	const val MAJOR = "133"
 
-	const val USER_AGENT =
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
-			"Chrome/$MAJOR.0.0.0 Safari/537.36"
+	/**
+	 * Android Chrome, not desktop Chrome. The challenge is solved inside an Android [android.webkit.WebView],
+	 * and Turnstile fingerprints far more than the UA string: touch support, `navigator.platform`,
+	 * `screen`, the WebGL renderer (an Adreno/Mali string), pointer/hover media queries. A WebView
+	 * claiming `Windows NT 10.0` contradicts every one of those, which is scored as automation — so the
+	 * challenge is either never cleared or the clearance is rejected on first reuse. Claiming what the
+	 * device actually is has nothing to contradict.
+	 */
+	const val USER_AGENT = UserAgents.CHROME_MOBILE
 
 	const val SEC_CH_UA =
 		"\"Not(A:Brand\";v=\"99\", \"Google Chrome\";v=\"$MAJOR\", \"Chromium\";v=\"$MAJOR\""
 
-	const val SEC_CH_UA_MOBILE = "?0"
-	const val SEC_CH_UA_PLATFORM = "\"Windows\""
+	const val SEC_CH_UA_MOBILE = "?1"
+	const val SEC_CH_UA_PLATFORM = "\"Android\""
 
 	const val ACCEPT_HTML =
 		"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"

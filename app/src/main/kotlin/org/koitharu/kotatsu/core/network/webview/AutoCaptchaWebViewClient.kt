@@ -7,8 +7,8 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.CancellableContinuation
-import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import org.koitharu.kotatsu.core.network.cookies.AndroidCookieJar
 import org.koitharu.kotatsu.core.network.cookies.MutableCookieJar
 import org.koitharu.kotatsu.core.util.ext.printStackTraceDebug
 import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
@@ -97,10 +97,26 @@ internal class AutoCaptchaWebViewClient(
 		}
 	}
 
+	/**
+	 * A solve is proven by one thing only: a `cf_clearance` that is present, non-empty, and different
+	 * from the value held before the attempt. Anything weaker reports success while the request that
+	 * follows is challenged again, which is exactly the loop this class kept producing — a substring
+	 * test for `cf_clearance=` also matches the emptied cookie a failed purge leaves behind.
+	 */
 	private fun isClearanceObtained(): Boolean {
 		val clearance = CloudFlareHelper.getClearanceCookie(cookieJar, targetUrl)
-		return clearance != null && clearance != oldClearance
+		if (isFresh(clearance)) return true
+		// The jar can lag behind the WebView by one sync, so consult the live store too.
+		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return false
+		val raw = CookieManager.getInstance().getCookie(targetUrl) ?: return false
+		return raw.split(';').any { part ->
+			val cookie = AndroidCookieJar.parseWebViewCookie(httpUrl, part)
+			cookie?.name == CF_CLEARANCE && isFresh(cookie?.value)
+		}
 	}
+
+	private fun isFresh(clearance: String?): Boolean =
+		!clearance.isNullOrBlank() && clearance != oldClearance
 
 	/**
 	 * Inject the stealth anti-detection script. This masks bot fingerprints
@@ -118,9 +134,10 @@ internal class AutoCaptchaWebViewClient(
 	private fun maybeReinjectSolver(webView: WebView) {
 		if (isResumed) return
 		if (scriptInjectCount >= MAX_SCRIPT_INJECTIONS) return
-		// Light re-inject of one-shot click strategies without restarting the loop.
+		// Light re-inject of one-shot click strategies and native hardware touch.
 		scriptInjectCount++
 		try {
+			dispatchHardwareTouch(webView)
 			webView.evaluateJavascript(CaptchaSolverScript.SOLVE_SCRIPT, null)
 		} catch (e: Exception) {
 			e.printStackTraceDebug()
@@ -136,7 +153,11 @@ internal class AutoCaptchaWebViewClient(
 				if (isResumed) return@evaluateJavascript
 				val isChallenge = result?.contains("true") == true
 				if (!isChallenge) {
-					// Page may already have passed; re-check cookies once more.
+					// The challenge screen is gone, which is necessary but not sufficient: an error
+					// page, an interstitial that redirected nowhere, or a plain rate-limit page all
+					// look like "no challenge" too. Resuming here without a cookie is what reported
+					// success while the retried request was challenged again — the loop. Keep polling
+					// and let the timeout decide instead.
 					syncCookiesFromWebView()
 					if (isClearanceObtained()) {
 						resumeOnce(webView)
@@ -145,6 +166,7 @@ internal class AutoCaptchaWebViewClient(
 				}
 
 				scriptInjectCount++
+				dispatchHardwareTouch(webView)
 				// One-shot click attempt (covers managed checkbox / verify buttons).
 				webView.evaluateJavascript(CaptchaSolverScript.SOLVE_SCRIPT) {
 					syncCookiesFromWebView()
@@ -164,21 +186,25 @@ internal class AutoCaptchaWebViewClient(
 		}
 	}
 
+	private fun dispatchHardwareTouch(webView: WebView) {
+		webView.tapChallengeWidget(isObsolete = { isResumed })
+	}
+
 	/**
 	 * Sync cookies from Android WebView CookieManager back into OkHttp's CookieJar.
 	 * Without this, [isClearanceObtained] never sees `cf_clearance` set by the WebView.
 	 *
-	 * Uses [Cookie.parse] so domain/path/hostOnly attributes are preserved correctly
-	 * for subsequent requests to the same host.
+	 * Goes through [AndroidCookieJar.parseWebViewCookie]: `CookieManager.getCookie` hides every
+	 * attribute, and a bare [Cookie.parse] then applies OkHttp's default-path rule, storing the
+	 * clearance under a *second* identity scoped to the challenge URL's directory. Both copies are
+	 * then sent together, Cloudflare reads the stale one and challenges again — endlessly.
 	 */
 	private fun syncCookiesFromWebView() {
 		val httpUrl = targetUrl.toHttpUrlOrNull() ?: return
 		val cookieManager = CookieManager.getInstance()
 		val cookieString = cookieManager.getCookie(targetUrl) ?: return
 		val cookies = cookieString.split(";").mapNotNull { raw ->
-			val trimmed = raw.trim()
-			if (trimmed.isEmpty()) return@mapNotNull null
-			Cookie.parse(httpUrl, trimmed)
+			AndroidCookieJar.parseWebViewCookie(httpUrl, raw)
 		}
 		if (cookies.isNotEmpty()) {
 			cookieJar.saveFromResponse(httpUrl, cookies)
@@ -206,5 +232,6 @@ internal class AutoCaptchaWebViewClient(
 	companion object {
 		private const val MAX_SCRIPT_INJECTIONS = 20
 		private const val COOKIE_CHECK_INTERVAL = 500L
+		private const val CF_CLEARANCE = "cf_clearance"
 	}
 }
